@@ -1,5 +1,5 @@
 // ============================================================
-// AG-UI Travel Agent — LLM orchestration loop
+// AG-UI Travel Agent — LLM orchestration loop (Gemini)
 //
 // Takes a user message, builds an LLM tool manifest from all
 // currently connected sites (prefixing tool names with siteLabel
@@ -10,10 +10,10 @@
 // so both the Flights and Hotels panels update in real time.
 // ============================================================
 
-import OpenAI from "openai";
+import { GoogleGenAI } from "@google/genai";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const MODEL  = process.env.LLM_MODEL ?? "gpt-4o";
+const ai    = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const MODEL = process.env.LLM_MODEL ?? "gemini-2.0-flash";
 
 // Delimiter used in prefixed tool names (OpenAI function names: [a-zA-Z0-9_-])
 const PREFIX_SEP = "__";
@@ -41,24 +41,23 @@ Be concise. Use plain text with line breaks rather than markdown tables.
 When quoting prices, be specific. Summarise total cost at the end.`;
 
 // ── Tool manifest builder ─────────────────────────────────────
-// Turns each site's tool list into OpenAI function definitions,
+// Turns each site's tool list into Gemini functionDeclarations,
 // prefixing names with the siteLabel so the model knows which
 // site to route the call to.
+// NOTE: "travelagent" connections have no tools — skip them.
 function buildToolDefs(connections) {
-  const defs = [];
+  const declarations = [];
   for (const [siteLabel, { tools }] of connections.entries()) {
+    if (siteLabel === "travelagent") continue;
     for (const tool of tools) {
-      defs.push({
-        type: "function",
-        function: {
-          name:        `${siteLabel}${PREFIX_SEP}${tool.name}`,
-          description: `[${siteLabel}] ${tool.description}`,
-          parameters:  tool.parameters ?? { type: "object", properties: {} },
-        },
+      declarations.push({
+        name:        `${siteLabel}${PREFIX_SEP}${tool.name}`,
+        description: `[${siteLabel}] ${tool.description}`,
+        parameters:  tool.parameters ?? { type: "object", properties: {} },
       });
     }
   }
-  return defs;
+  return declarations.length > 0 ? [{ functionDeclarations: declarations }] : [];
 }
 
 // ── Parse prefixed tool name ──────────────────────────────────
@@ -75,9 +74,9 @@ function parsePrefixedName(prefixed) {
 export async function handleUserMessage(userMessage, _originSiteLabel, { connections, callSiteTool, broadcast }) {
   const toolDefs = buildToolDefs(connections);
 
+  // Gemini message history — starts with the user's message
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user",   content: userMessage },
+    { role: "user", parts: [{ text: userMessage }] },
   ];
 
   await agentLoop(messages, toolDefs, { callSiteTool, broadcast });
@@ -93,107 +92,81 @@ async function agentLoop(messages, toolDefs, { callSiteTool, broadcast }, depth 
   }
 
   const messageId = newMsgId();
-
-  // ── Stream one LLM turn ────────────────────────────────────
-  let textBuffer   = "";
-  const toolCallsMap = {}; // delta index → { id, name, argumentsBuffer }
-  let finishReason = null;
-
-  const streamParams = {
-    model:    MODEL,
-    stream:   true,
-    messages,
-    ...(toolDefs.length > 0 && { tools: toolDefs, tool_choice: "auto" }),
-  };
+  let textBuffer  = "";
+  const toolCalls = []; // { name, args }
 
   try {
-    const stream = await openai.chat.completions.create(streamParams);
+    const stream = await ai.models.generateContentStream({
+      model:    MODEL,
+      contents: messages,
+      config: {
+        systemInstruction: SYSTEM_PROMPT,
+        ...(toolDefs.length > 0 && { tools: toolDefs }),
+      },
+    });
 
     for await (const chunk of stream) {
-      const choice = chunk.choices?.[0];
-      if (!choice) continue;
-
-      if (choice.finish_reason) finishReason = choice.finish_reason;
-
-      const delta = choice.delta;
-      if (!delta) continue;
-
-      // Text delta → broadcast immediately for streaming UX
-      if (delta.content) {
-        textBuffer += delta.content;
-        broadcast({ type: "TEXT_MESSAGE", messageId, delta: delta.content });
-      }
-
-      // Tool call deltas — accumulate by index
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          if (!toolCallsMap[tc.index]) {
-            toolCallsMap[tc.index] = { id: "", name: "", argumentsBuffer: "" };
-          }
-          const slot = toolCallsMap[tc.index];
-          if (tc.id)               slot.id               += tc.id;
-          if (tc.function?.name)   slot.name             += tc.function.name;
-          if (tc.function?.arguments) slot.argumentsBuffer += tc.function.arguments;
+      for (const part of chunk.candidates?.[0]?.content?.parts ?? []) {
+        if (part.text) {
+          textBuffer += part.text;
+          broadcast({ type: "TEXT_MESSAGE", messageId, delta: part.text });
+        }
+        if (part.functionCall) {
+          toolCalls.push({
+            name: part.functionCall.name,
+            args: part.functionCall.args ?? {},
+          });
         }
       }
     }
   } catch (err) {
-    console.error(`[agent] OpenAI stream error (depth=${depth}): ${err.message}`);
+    console.error(`[agent] Gemini stream error (depth=${depth}): ${err.message}`);
     const errId = newMsgId();
     broadcast({ type: "TEXT_MESSAGE",     messageId: errId, delta: `Sorry, I ran into an error: ${err.message}` });
     broadcast({ type: "TEXT_MESSAGE_END", messageId: errId });
     return;
   }
 
-  const toolCalls = Object.values(toolCallsMap);
-
-  // ── No tool calls: final response ─────────────────────────
-  if (finishReason !== "tool_calls" || toolCalls.length === 0) {
+  // ── No tool calls: final response ──────────────────────────
+  if (toolCalls.length === 0) {
     broadcast({ type: "TEXT_MESSAGE_END", messageId });
     return;
   }
 
   // ── There are tool calls ───────────────────────────────────
-  // Close the text bubble if the model also emitted text before the tools
+  // Close the text bubble if the model emitted text before tools
   if (textBuffer) {
     broadcast({ type: "TEXT_MESSAGE_END", messageId });
   }
 
-  // Add the assistant's tool-call message to history
+  // Add model's response (text + function calls) to history
   messages.push({
-    role:    "assistant",
-    content: textBuffer || null,
-    tool_calls: toolCalls.map((tc) => ({
-      id:       tc.id,
-      type:     "function",
-      function: { name: tc.name, arguments: tc.argumentsBuffer },
-    })),
+    role:  "model",
+    parts: [
+      ...(textBuffer ? [{ text: textBuffer }] : []),
+      ...toolCalls.map((tc) => ({ functionCall: { name: tc.name, args: tc.args } })),
+    ],
   });
 
-  // Execute tool calls sequentially — most tools depend on prior results
+  // Execute tool calls sequentially and collect functionResponse parts
+  const resultParts = [];
   for (const tc of toolCalls) {
     const { siteLabel, toolName } = parsePrefixedName(tc.name);
-
-    let resultContent;
+    let result;
     try {
-      let args;
-      try { args = JSON.parse(tc.argumentsBuffer); } catch { args = {}; }
-
-      console.log(`[agent] → ${siteLabel}::${toolName}(${tc.argumentsBuffer.slice(0, 200)})`);
-      const raw = await callSiteTool(siteLabel, toolName, args);
-      resultContent = typeof raw === "string" ? raw : JSON.stringify(raw);
-      console.log(`[agent] ← ${siteLabel}::${toolName}: ${resultContent.slice(0, 200)}`);
+      console.log(`[agent] → ${siteLabel}::${toolName}(${JSON.stringify(tc.args).slice(0, 200)})`);
+      const raw = await callSiteTool(siteLabel, toolName, tc.args);
+      try { result = JSON.parse(raw); } catch { result = { result: String(raw) }; }
+      console.log(`[agent] ← ${siteLabel}::${toolName}: ${JSON.stringify(result).slice(0, 200)}`);
     } catch (err) {
       console.warn(`[agent] Tool error ${siteLabel}::${toolName}: ${err.message}`);
-      resultContent = JSON.stringify({ error: err.message });
+      result = { error: err.message };
     }
-
-    messages.push({
-      role:         "tool",
-      tool_call_id: tc.id,
-      content:      resultContent,
-    });
+    // Gemini function responses go back as "user" parts
+    resultParts.push({ functionResponse: { name: tc.name, response: result } });
   }
+
+  messages.push({ role: "user", parts: resultParts });
 
   // Continue the loop with the updated message history
   await agentLoop(messages, toolDefs, { callSiteTool, broadcast }, depth + 1);

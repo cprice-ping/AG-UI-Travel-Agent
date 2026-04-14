@@ -12,11 +12,16 @@
 // ============================================================
 
 import { createServer } from "http";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { join, dirname } from "path";
 import { WebSocketServer } from "ws";
 import express from "express";
 import cors from "cors";
 import { randomUUID } from "crypto";
 import { handleUserMessage } from "./agent.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Express app ───────────────────────────────────────────────
 const app = express();
@@ -91,6 +96,14 @@ export function broadcast(msg) {
   }
 }
 
+// ── broadcastSitesStatus ──────────────────────────────────────
+// Tells all connections which sites currently have tools available.
+// "travelagent" is the chat UI — not a tool-bearing site — so exclude it.
+function broadcastSitesStatus() {
+  const sites = [...connections.keys()].filter((l) => l !== "travelagent");
+  broadcast({ type: "SITES_STATUS", sites });
+}
+
 // ── WebSocket server ──────────────────────────────────────────
 const server = createServer(app);
 const wss    = new WebSocketServer({ noServer: true });
@@ -137,6 +150,7 @@ wss.on("connection", (ws) => {
           `[ws] ✓ ${siteLabel} connected from ${msg.origin ?? "(unknown)"}` +
           ` — ${msg.tools?.length ?? 0} tool(s): ${msg.tools?.map((t) => t.name).join(", ") || "(none)"}`
         );
+        broadcastSitesStatus();
         break;
 
       case "TOOLS_UPDATE":
@@ -178,12 +192,18 @@ wss.on("connection", (ws) => {
     if (siteLabel) {
       connections.delete(siteLabel);
       console.log(`[ws] ${siteLabel} disconnected`);
+      broadcastSitesStatus();
     }
   });
 
   ws.on("error", (err) => {
     console.error(`[ws] ${siteLabel ?? "(unknown)"} socket error: ${err.message}`);
   });
+});
+
+// ── HTTP: GET / — serve standalone chat UI ───────────────────
+app.get("/", (_req, res) => {
+  res.sendFile(join(__dirname, "index.html"));
 });
 
 // ── HTTP: POST /chat ──────────────────────────────────────────

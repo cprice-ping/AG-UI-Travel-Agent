@@ -10,8 +10,8 @@ services:
     environment:
       PORT:           "8000"
       ALLOWED_ORIGIN: "https://cprice-ping.github.io,http://localhost:8080"
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
-      LLM_MODEL:      "${LLM_MODEL:-gpt-4o}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+      LLM_MODEL:      "${LLM_MODEL:-gemini-2.0-flash}"
     restart: unless-stopped
     healthcheck:
       test:     ["CMD", "wget", "-qO-", "http://localhost:8000/health"]

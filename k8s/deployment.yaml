@@ -25,11 +25,11 @@ spec:
             - configMapRef:
                 name: travelagent-config
           env:
-            - name:      OPENAI_API_KEY
+            - name:      GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: travelagent-secrets
-                  key:  OPENAI_API_KEY
+                  key:  GEMINI_API_KEY
           readinessProbe:
             httpGet:
               path: /health

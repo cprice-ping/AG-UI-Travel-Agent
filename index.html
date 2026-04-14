@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Travel Agent</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0f172a;
+      --surface:     #1e293b;
+      --surface-2:   #273449;
+      --border:      #334155;
+      --text:        #f1f5f9;
+      --muted:       #94a3b8;
+      --primary:     #6366f1;
+      --primary-dk:  #4f46e5;
+      --green:       #22c55e;
+      --amber:       #f59e0b;
+      --red:         #ef4444;
+      --radius:      0.5rem;
+      --font:        -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 15px; }
+
+    /* ── Layout ──────────────────────────────────────────── */
+    .shell {
+      display: grid;
+      grid-template-rows: 56px 1fr;
+      grid-template-columns: 260px 1fr;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Nav ─────────────────────────────────────────────── */
+    .nav {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0 1.25rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-title { font-size: 1.1rem; font-weight: 700; }
+    .nav-sub   { font-size: 0.8rem; color: var(--muted); }
+    .nav-spacer { flex: 1; }
+
+    .ws-status {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .ws-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--border);
+      transition: background 0.3s;
+    }
+    .ws-dot.connected    { background: var(--green); }
+    .ws-dot.reconnecting { background: var(--amber); }
+    .ws-dot.error        { background: var(--red); }
+
+    /* ── Sidebar ─────────────────────────────────────────── */
+    .sidebar {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      overflow-y: auto;
+    }
+
+    .sidebar-section-title {
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 0.6rem;
+    }
+
+    .site-list { display: flex; flex-direction: column; gap: 0.5rem; }
+
+    .site-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.5rem 0.75rem;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 0.85rem;
+    }
+    .site-row-label { flex: 1; font-weight: 500; }
+    .site-badge {
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 0.15rem 0.45rem;
+      border-radius: 999px;
+      background: var(--border);
+      color: var(--muted);
+    }
+    .site-badge.live { background: #14532d; color: var(--green); }
+
+    .tips { display: flex; flex-direction: column; gap: 0.4rem; }
+    .tip {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.55rem 0.75rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+      line-height: 1.4;
+    }
+    .tip:hover { border-color: var(--primary); color: var(--text); }
+
+    /* ── Chat area ───────────────────────────────────────── */
+    .chat-area {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .chat-thread {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .thread-empty {
+      color: var(--muted);
+      font-size: 0.875rem;
+      text-align: center;
+      margin: auto;
+      line-height: 1.6;
+    }
+    .thread-empty p { margin-bottom: 0.5rem; }
+
+    .bubble {
+      max-width: 72%;
+      padding: 0.6rem 0.9rem;
+      border-radius: var(--radius);
+      font-size: 0.9rem;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .bubble-user {
+      align-self: flex-end;
+      background: var(--primary);
+      color: #fff;
+      border-bottom-right-radius: 2px;
+    }
+    .bubble-assistant {
+      align-self: flex-start;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 2px;
+    }
+    .bubble-assistant.streaming::after {
+      content: "▌";
+      animation: blink 0.8s step-end infinite;
+      color: var(--primary);
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    /* ── Input bar ───────────────────────────────────────── */
+    .input-bar {
+      display: flex;
+      gap: 0.6rem;
+      padding: 0.875rem 1.25rem;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .chat-input {
+      flex: 1;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 0.9rem;
+      padding: 0.55rem 0.8rem;
+      resize: none;
+      outline: none;
+      min-height: 40px;
+      max-height: 120px;
+      transition: border-color 0.15s;
+    }
+    .chat-input:focus { border-color: var(--primary); }
+    .chat-input::placeholder { color: var(--muted); }
+
+    .btn-send {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius);
+      padding: 0.55rem 1.1rem;
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s;
+    }
+    .btn-send:hover:not(:disabled) { background: var(--primary-dk); }
+    .btn-send:disabled { opacity: 0.45; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- Nav -->
+  <nav class="nav">
+    <span style="font-size:1.3rem">✈️🏨</span>
+    <div>
+      <div class="nav-title">Travel Agent</div>
+      <div class="nav-sub">AG-UI Custom Agent</div>
+    </div>
+    <div class="nav-spacer"></div>
+    <div class="ws-status">
+      <div class="ws-dot" id="ws-dot"></div>
+      <span id="ws-label">Connecting…</span>
+    </div>
+  </nav>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+
+    <div>
+      <div class="sidebar-section-title">Connected Sites</div>
+      <div class="site-list" id="site-list">
+        <div class="site-row">
+          <span>✈️</span>
+          <span class="site-row-label">Flights</span>
+          <span class="site-badge" id="badge-flights">waiting</span>
+        </div>
+        <div class="site-row">
+          <span>🏨</span>
+          <span class="site-row-label">Hotels</span>
+          <span class="site-badge" id="badge-hotels">waiting</span>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="sidebar-section-title">Try asking</div>
+      <div class="tips" id="tips">
+        <div class="tip">Book me a flight from SFO to NYC on May 15 and a hotel in NYC for 3 nights starting May 15</div>
+        <div class="tip">Find me the cheapest flight to MIA and a 4-star hotel under $260/night</div>
+        <div class="tip">What flights are available from JFK to LHR?</div>
+        <div class="tip">Show me hotels in NYC under $200/night</div>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- Chat -->
+  <div class="chat-area">
+    <div class="chat-thread" id="chat-thread">
+      <div class="thread-empty" id="thread-empty">
+        <p>👋 Open the <strong>Flights</strong> and <strong>Hotels</strong> sites in other tabs,<br>sign in, and set their Agent URL to this server's WebSocket address.</p>
+        <p>Once both sites are connected (green badges), ask me to book a trip.</p>
+      </div>
+    </div>
+    <div class="input-bar">
+      <textarea
+        class="chat-input"
+        id="chat-input"
+        placeholder="Ask me to search or book flights and hotels…"
+        rows="1"
+      ></textarea>
+      <button class="btn-send" id="btn-send">Send</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+
+// ── WebSocket connection ──────────────────────────────────────
+const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+
+let ws           = null;
+let reconnectN   = 0;
+const MAX_RECONNECT = 5;
+const RECONNECT_MS  = 3000;
+
+const dot   = document.getElementById("ws-dot");
+const label = document.getElementById("ws-label");
+
+function setStatus(state, text) {
+  dot.className  = `ws-dot ${state}`;
+  label.textContent = text;
+}
+
+function connect() {
+  setStatus("reconnecting", reconnectN > 0 ? `Reconnecting (${reconnectN})…` : "Connecting…");
+  ws = new WebSocket(WS_URL);
+
+  ws.addEventListener("open", () => {
+    reconnectN = 0;
+    setStatus("connected", "Connected");
+    ws.send(JSON.stringify({ type: "SITE_CONNECT", siteLabel: "travelagent", origin: location.origin, tools: [] }));
+  });
+
+  ws.addEventListener("message", (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+    handleMessage(msg);
+  });
+
+  ws.addEventListener("close", () => {
+    setStatus("", "Disconnected");
+    scheduleReconnect();
+  });
+
+  ws.addEventListener("error", () => {
+    setStatus("error", "Connection error");
+  });
+}
+
+function scheduleReconnect() {
+  if (reconnectN >= MAX_RECONNECT) { setStatus("error", "Could not connect"); return; }
+  reconnectN++;
+  setTimeout(connect, RECONNECT_MS);
+}
+
+connect();
+
+// ── Message handler ───────────────────────────────────────────
+let currentBubble    = null;
+let currentMessageId = null;
+
+function handleMessage(msg) {
+  switch (msg.type) {
+
+    case "SITES_STATUS":
+      updateSiteBadges(msg.sites ?? []);
+      break;
+
+    case "TEXT_MESSAGE":
+      if (msg.messageId !== currentMessageId) {
+        currentMessageId = msg.messageId;
+        currentBubble    = appendBubble("assistant");
+        currentBubble.classList.add("streaming");
+      }
+      if (msg.delta && currentBubble) currentBubble.textContent += msg.delta;
+      scrollThread();
+      break;
+
+    case "TEXT_MESSAGE_END":
+      if (currentBubble) currentBubble.classList.remove("streaming");
+      currentBubble    = null;
+      currentMessageId = null;
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ── Sites status ──────────────────────────────────────────────
+function updateSiteBadges(sites) {
+  for (const id of ["flights", "hotels"]) {
+    const badge = document.getElementById(`badge-${id}`);
+    if (!badge) continue;
+    if (sites.includes(id)) {
+      badge.textContent = "live";
+      badge.className   = "site-badge live";
+    } else {
+      badge.textContent = "waiting";
+      badge.className   = "site-badge";
+    }
+  }
+}
+
+// ── Chat helpers ──────────────────────────────────────────────
+function appendBubble(role, text = "") {
+  document.getElementById("thread-empty")?.remove();
+  const el = document.createElement("div");
+  el.className   = `bubble bubble-${role}`;
+  el.textContent = text;
+  document.getElementById("chat-thread").appendChild(el);
+  scrollThread();
+  return el;
+}
+
+function scrollThread() {
+  const t = document.getElementById("chat-thread");
+  t.scrollTop = t.scrollHeight;
+}
+
+// ── Send message ──────────────────────────────────────────────
+function sendMessage() {
+  const input = document.getElementById("chat-input");
+  const text  = input.value.trim();
+  if (!text) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { alert("Not connected to the agent yet."); return; }
+
+  appendBubble("user", text);
+  ws.send(JSON.stringify({ type: "USER_MESSAGE", message: text }));
+  input.value = "";
+  input.style.height = "";
+  scrollThread();
+}
+
+document.getElementById("btn-send").addEventListener("click", sendMessage);
+
+document.getElementById("chat-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+// Auto-grow textarea
+document.getElementById("chat-input").addEventListener("input", function() {
+  this.style.height = "auto";
+  this.style.height = Math.min(this.scrollHeight, 120) + "px";
+});
+
+// Tip clicks → fill input
+document.getElementById("tips").addEventListener("click", (e) => {
+  const tip = e.target.closest(".tip");
+  if (!tip) return;
+  const input = document.getElementById("chat-input");
+  input.value = tip.textContent.trim();
+  input.focus();
+  input.dispatchEvent(new Event("input"));
+});
+</script>
+</body>
+</html>

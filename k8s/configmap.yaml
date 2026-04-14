@@ -5,5 +5,5 @@ metadata:
   namespace: travelagent
 data:
   ALLOWED_ORIGIN: "https://cprice-ping.github.io"
-  LLM_MODEL:      "gpt-4o"
+  LLM_MODEL:      "gemini-2.0-flash"
   PORT:           "8000"
