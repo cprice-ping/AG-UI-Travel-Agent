@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name:      travelagent
+  namespace: travelagent
+  labels:
+    app: travelagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: travelagent
+  template:
+    metadata:
+      labels:
+        app: travelagent
+    spec:
+      containers:
+        - name:  travelagent
+          image: pricecs/ag-ui-travel-agent:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: travelagent-config
+          env:
+            - name:      OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: travelagent-secrets
+                  key:  OPENAI_API_KEY
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds:       10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds:       30

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name:      travelagent-config
+  namespace: travelagent
+data:
+  ALLOWED_ORIGIN: "https://cprice-ping.github.io"
+  LLM_MODEL:      "gpt-4o"
+  PORT:           "8000"
