@@ -2,6 +2,7 @@
 
 import { useCoAgent, useCopilotAction } from "@copilotkit/react-core";
 import { CopilotKitCSSProperties, CopilotSidebar } from "@copilotkit/react-ui";
+import { useSession, signIn, signOut } from "next-auth/react";
 
 // ─── Types (mirror agent state) ──────────────────────────────────────────────
 
@@ -63,6 +64,8 @@ type AgentState = {
   travelDates: TravelDates;
   flightResults: FlightResult[];
   hotelResults: HotelResult[];
+  /** PingOne Bearer token — forwarded to the MCP server for each tool call. */
+  userToken: string;
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -99,6 +102,9 @@ export default function TravelAgentPage() {
 // ─── Main Content ─────────────────────────────────────────────────────────────
 
 function TravelContent() {
+  const { data: session, status: authStatus } = useSession();
+  const accessToken = (session as { accessToken?: string } | null)?.accessToken ?? "";
+
   const { state, setState } = useCoAgent<AgentState>({
     name: "starterAgent",
     initialState: {
@@ -108,8 +114,15 @@ function TravelContent() {
       travelDates: { start: "", end: "" },
       flightResults: [],
       hotelResults: [],
+      userToken: accessToken,
     },
   });
+
+  // Keep userToken in sync when the session changes (e.g. after login)
+  const prevToken = state.userToken;
+  if (prevToken !== accessToken) {
+    setState((prev) => ({ ...prev, userToken: accessToken } as AgentState));
+  }
 
   // ── Frontend actions the agent can call ────────────────────────────────────
 
@@ -295,30 +308,60 @@ function TravelContent() {
             <span className="text-3xl">✈️</span>
             <div>
               <h1 className="text-xl font-bold text-white">AI Travel Planner</h1>
-              <p className="text-sky-200 text-sm">Powered by Gemini + AG-UI</p>
+              <p className="text-sky-200 text-sm">Powered by Gemini + AG-UI + MCP</p>
             </div>
           </div>
 
-          {/* Budget pill */}
-          {state.budget && (
-            <div className="flex items-center gap-3 bg-white/10 rounded-full px-4 py-2">
-              <span className="text-white/70 text-sm">Budget:</span>
-              <span className="text-white font-semibold">
-                {state.budget.currency} {state.budget.total.toLocaleString()}
-              </span>
-              <div className="w-24 h-2 bg-white/20 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-gradient-to-r from-emerald-400 to-sky-400 rounded-full transition-all"
-                  style={{ width: `${budgetPercent}%` }}
-                />
+          {/* Right side: budget pill + auth button */}
+          <div className="flex items-center gap-3">
+            {/* Budget pill */}
+            {state.budget && (
+              <div className="flex items-center gap-3 bg-white/10 rounded-full px-4 py-2">
+                <span className="text-white/70 text-sm">Budget:</span>
+                <span className="text-white font-semibold">
+                  {state.budget.currency} {state.budget.total.toLocaleString()}
+                </span>
+                <div className="w-24 h-2 bg-white/20 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-emerald-400 to-sky-400 rounded-full transition-all"
+                    style={{ width: `${budgetPercent}%` }}
+                  />
+                </div>
+                <span className="text-white/70 text-sm">
+                  {totalActivityCost > 0
+                    ? `~${state.budget.currency} ${totalActivityCost} planned`
+                    : `${budgetPercent}% allocated`}
+                </span>
               </div>
-              <span className="text-white/70 text-sm">
-                {totalActivityCost > 0
-                  ? `~${state.budget.currency} ${totalActivityCost} planned`
-                  : `${budgetPercent}% allocated`}
-              </span>
-            </div>
-          )}
+            )}
+
+            {/* Auth button */}
+            {authStatus === "loading" ? (
+              <div className="w-24 h-9 rounded-full bg-white/10 animate-pulse" />
+            ) : session ? (
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 bg-emerald-500/20 border border-emerald-400/40 rounded-full px-3 py-1.5">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                  <span className="text-emerald-200 text-sm font-medium">
+                    {session.user?.name ?? session.user?.email ?? "Logged in"}
+                  </span>
+                </div>
+                <button
+                  onClick={() => signOut()}
+                  className="text-white/60 hover:text-white text-sm px-3 py-1.5 rounded-full border border-white/20 hover:border-white/40 transition-all"
+                >
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => signIn("pingone")}
+                className="flex items-center gap-2 bg-sky-500 hover:bg-sky-400 text-white text-sm font-medium px-4 py-2 rounded-full transition-all shadow-lg shadow-sky-500/30"
+              >
+                <span>🔐</span> Login with PingOne
+              </button>
+            )}
+          </div>
         </div>
       </header>
 

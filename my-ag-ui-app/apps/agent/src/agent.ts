@@ -1,22 +1,25 @@
 /**
  * Travel Agent - powered by Gemini via LangChain.
  * Helps users plan trips with destinations, itineraries, flights, hotels and weather.
+ *
+ * Tools are served by an external MCP server (HTTP Streaming transport).
+ * Each invocation authenticates using the PingOne access token stored in
+ * the agent state, forwarded as a Bearer token to the MCP server.
  */
 
-import { z } from "zod";
 import { RunnableConfig } from "@langchain/core/runnables";
-import { tool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { AIMessage, SystemMessage } from "@langchain/core/messages";
 import { MemorySaver, START, StateGraph } from "@langchain/langgraph";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 import {
   convertActionsToDynamicStructuredTools,
   CopilotKitStateAnnotation,
 } from "@copilotkit/sdk-js/langgraph";
 import { Annotation } from "@langchain/langgraph";
 
-// ─── State shape ────────────────────────────────────────────────────────────
+// ─── State shape ─────────────────────────────────────────────────────────────
 
 export type Destination = {
   name: string;
@@ -75,180 +78,58 @@ const AgentStateAnnotation = Annotation.Root({
   travelDates: Annotation<TravelDates>,
   flightResults: Annotation<FlightResult[]>,
   hotelResults: Annotation<HotelResult[]>,
+  /** PingOne access token forwarded from the browser session (set by the frontend). */
+  userToken: Annotation<string>,
 });
 
 export type AgentState = typeof AgentStateAnnotation.State;
 
-// ─── Tools ──────────────────────────────────────────────────────────────────
+// ─── MCP client factory ───────────────────────────────────────────────────────
 
-const searchFlights = tool(
-  (args) => {
-    const mockFlights: FlightResult[] = [
-      {
-        airline: "SkyJet Airways",
-        flightNumber: `SJ${Math.floor(Math.random() * 900) + 100}`,
-        departure: `${args.departureDate} 08:30`,
-        arrival: `${args.departureDate} 14:45`,
-        price: Math.floor(Math.random() * 400) + 250,
-        duration: "6h 15m",
-      },
-      {
-        airline: "Global Connect",
-        flightNumber: `GC${Math.floor(Math.random() * 900) + 100}`,
-        departure: `${args.departureDate} 13:00`,
-        arrival: `${args.departureDate} 19:20`,
-        price: Math.floor(Math.random() * 300) + 180,
-        duration: "6h 20m",
-      },
-      {
-        airline: "AirVoyage",
-        flightNumber: `AV${Math.floor(Math.random() * 900) + 100}`,
-        departure: `${args.departureDate} 21:15`,
-        arrival: `${args.departureDate} 03:30+1`,
-        price: Math.floor(Math.random() * 200) + 150,
-        duration: "6h 15m",
-      },
-    ];
-    return JSON.stringify(mockFlights);
-  },
-  {
-    name: "searchFlights",
-    description: "Search for available flights between two cities.",
-    schema: z.object({
-      origin: z.string().describe("Departure city or airport code"),
-      destination: z.string().describe("Arrival city or airport code"),
-      departureDate: z.string().describe("Departure date in YYYY-MM-DD format"),
-    }),
-  },
-);
+const MCP_SERVER_URL = process.env.MCP_SERVER_URL ?? "http://localhost:3100/mcp";
 
-const searchHotels = tool(
-  (args) => {
-    const mockHotels: HotelResult[] = [
-      {
-        name: `The Grand ${args.destination} Hotel`,
-        stars: 5,
-        pricePerNight: Math.floor(Math.random() * 200) + 200,
-        amenities: ["Pool", "Spa", "Restaurant", "Gym", "Free WiFi"],
-        location: `Central ${args.destination}`,
+/**
+ * Creates a short-lived MCP client authenticated with the supplied Bearer token.
+ * The caller is responsible for calling client.close() when done.
+ */
+function createMcpClient(token?: string): MultiServerMCPClient {
+  return new MultiServerMCPClient({
+    mcpServers: {
+      travel: {
+        url: MCP_SERVER_URL,
+        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+        // Disable SSE fallback — our server speaks Streamable HTTP natively.
+        automaticSSEFallback: false,
       },
-      {
-        name: `${args.destination} Boutique Inn`,
-        stars: 4,
-        pricePerNight: Math.floor(Math.random() * 100) + 100,
-        amenities: ["Breakfast included", "Free WiFi", "Bar"],
-        location: `Old Town ${args.destination}`,
-      },
-      {
-        name: `Budget Stay ${args.destination}`,
-        stars: 3,
-        pricePerNight: Math.floor(Math.random() * 60) + 50,
-        amenities: ["Free WiFi", "24h Reception"],
-        location: `${args.destination} City Centre`,
-      },
-    ];
-    return JSON.stringify(mockHotels);
-  },
-  {
-    name: "searchHotels",
-    description: "Search for available hotels in a destination.",
-    schema: z.object({
-      destination: z.string().describe("The city or destination to search hotels in"),
-      checkIn: z.string().describe("Check-in date in YYYY-MM-DD format"),
-      checkOut: z.string().describe("Check-out date in YYYY-MM-DD format"),
-    }),
-  },
-);
-
-const getDestinationInfo = tool(
-  (args) => {
-    const destinationData: Record<string, { description: string; highlights: string[]; bestTime: string; currency: string; language: string }> = {
-      paris: {
-        description: "The City of Light, known for art, fashion, gastronomy and culture.",
-        highlights: ["Eiffel Tower", "Louvre Museum", "Notre-Dame Cathedral", "Montmartre", "Seine River Cruises"],
-        bestTime: "April–June and September–November",
-        currency: "Euro (EUR)",
-        language: "French",
-      },
-      tokyo: {
-        description: "A mesmerizing blend of ultramodern and traditional, from neon-lit skyscrapers to historic temples.",
-        highlights: ["Shibuya Crossing", "Senso-ji Temple", "Tsukiji Fish Market", "Harajuku", "Mount Fuji Day Trip"],
-        bestTime: "March–May (cherry blossom) and September–November",
-        currency: "Japanese Yen (JPY)",
-        language: "Japanese",
-      },
-      bali: {
-        description: "An Indonesian island paradise with terraced rice paddies, volcanic mountains, and beautiful beaches.",
-        highlights: ["Uluwatu Temple", "Tegallalang Rice Terraces", "Sacred Monkey Forest", "Seminyak Beach", "Ubud Arts Village"],
-        bestTime: "April–October (dry season)",
-        currency: "Indonesian Rupiah (IDR)",
-        language: "Balinese / Indonesian",
-      },
-      barcelona: {
-        description: "A vibrant coastal city bursting with Modernista architecture, beaches, and world-class cuisine.",
-        highlights: ["Sagrada Família", "Park Güell", "La Rambla", "Gothic Quarter", "Camp Nou"],
-        bestTime: "May–June and September–October",
-        currency: "Euro (EUR)",
-        language: "Catalan / Spanish",
-      },
-    };
-
-    const key = args.destination.toLowerCase();
-    const info = Object.entries(destinationData).find(([k]) => key.includes(k));
-
-    if (info) {
-      return JSON.stringify({ destination: args.destination, ...info[1] });
-    }
-
-    return JSON.stringify({
-      destination: args.destination,
-      description: `${args.destination} is a wonderful travel destination with rich culture and unique experiences.`,
-      highlights: ["Local cuisine", "Cultural sites", "Natural scenery", "Shopping", "Nightlife"],
-      bestTime: "Spring or Autumn for mild weather",
-      currency: "Local currency",
-      language: "Local language",
-    });
-  },
-  {
-    name: "getDestinationInfo",
-    description: "Get detailed information about a travel destination including highlights, best time to visit, and practical tips.",
-    schema: z.object({
-      destination: z.string().describe("The destination city or region to get information about"),
-    }),
-  },
-);
-
-const getWeather = tool(
-  (args) => {
-    const conditions = ["Sunny ☀️", "Partly cloudy ⛅", "Warm and clear 🌤️", "Mild with light breeze 🌬️"];
-    const condition = conditions[Math.floor(Math.random() * conditions.length)];
-    const temp = Math.floor(Math.random() * 15) + 18;
-    return `Weather in ${args.location}: ${condition}, ${temp}°C (${Math.round(temp * 9/5 + 32)}°F). Humidity: ${Math.floor(Math.random() * 30) + 40}%. Perfect for exploring!`;
-  },
-  {
-    name: "getWeather",
-    description: "Get the current weather forecast for a travel destination.",
-    schema: z.object({
-      location: z.string().describe("The city or location to get weather for"),
-    }),
-  },
-);
-
-const tools = [searchFlights, searchHotels, getDestinationInfo, getWeather];
+    },
+    onConnectionError: "ignore", // degrade gracefully if MCP server is unavailable
+  });
+}
 
 // ─── Chat node ───────────────────────────────────────────────────────────────
 
 async function chat_node(state: AgentState, config: RunnableConfig) {
+  const mcpClient = createMcpClient(state.userToken);
+  let mcpTools: Awaited<ReturnType<MultiServerMCPClient["getTools"]>> = [];
+
+  try {
+    mcpTools = await mcpClient.getTools();
+  } catch (err) {
+    console.warn("[agent] MCP server unavailable — proceeding without tools:", (err as Error).message);
+  }
+
   const model = new ChatGoogleGenerativeAI({
     model: "gemini-2.5-flash",
     temperature: 0.7,
     apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
   });
 
-  const modelWithTools = model.bindTools!([
+  const allTools = [
     ...convertActionsToDynamicStructuredTools(state.copilotkit?.actions ?? []),
-    ...tools,
-  ]);
+    ...mcpTools,
+  ];
+
+  const modelWithTools = model.bindTools!(allTools);
 
   const travelContext = `
 Current travel plan:
@@ -256,31 +137,32 @@ Current travel plan:
 - Travel dates: ${JSON.stringify(state.travelDates ?? {})}
 - Budget: ${JSON.stringify(state.budget ?? {})}
 - Itinerary days: ${(state.itinerary ?? []).length}
+${state.userToken ? "- Authenticated: yes (MCP tools available)" : "- Authenticated: no (log in to enable travel search tools)"}
 `.trim();
 
   const systemMessage = new SystemMessage({
-    content: `You are an expert AI travel agent with access to both backend tools and frontend actions.
+    content: `You are an expert AI travel agent with access to both backend tools (via MCP) and frontend actions.
 
-BACKEND TOOLS (call these to fetch data — results show as UI cards automatically):
+BACKEND TOOLS — served by the MCP server, call these to fetch live data:
 - getDestinationInfo(destination)
 - searchFlights(origin, destination, departureDate)
 - searchHotels(destination, checkIn, checkOut)
 - getWeather(location)
 
 FRONTEND ACTIONS (call these to update the live travel dashboard on the left):
-- addDestination(name, country, description, emoji) — adds a destination card
-- setTravelDates(start, end) — sets trip dates in YYYY-MM-DD format
-- addItineraryDay(date, destination, activities[]) — adds a day to the itinerary
-  Each activity must have: time (HH:MM), name, description, estimatedCost (number),
-  and type — which MUST be one of: sightseeing, food, adventure, culture, relaxation, transport
-- updateBudget(total, currency, spent) — updates the budget tracker
+- addDestination(name, country, description, emoji)
+- setTravelDates(start, end) — YYYY-MM-DD format
+- addItineraryDay(date, destination, activities[])
+  Each activity: time (HH:MM), name, description, estimatedCost (number),
+  type — MUST be one of: sightseeing, food, adventure, culture, relaxation, transport
+- updateBudget(total, currency, spent)
 
-RULES — follow these strictly:
-1. When a destination is confirmed, ALWAYS call addDestination AND setTravelDates immediately.
+RULES:
+1. When a destination is confirmed, call addDestination AND setTravelDates immediately.
 2. When building an itinerary, call addItineraryDay for EACH day.
-3. When tool results (flights, hotels, weather) appear as UI cards, do NOT repeat their content in your text reply. Say something brief like "Here are some options!" instead.
-4. Keep chat replies short and conversational.
-5. Always suggest 1-2 hidden gems alongside famous attractions.
+3. Tool results appear as UI cards — do NOT repeat their content in text. Say "Here are some options!" instead.
+4. Keep replies short and conversational.
+5. If not authenticated, tell the user to log in to use flight/hotel search.
 
 ${travelContext}`,
   });
@@ -290,7 +172,25 @@ ${travelContext}`,
     config,
   );
 
+  await mcpClient.close();
   return { messages: response };
+}
+
+// ─── MCP tool node ────────────────────────────────────────────────────────────
+
+/**
+ * Custom tool node that initialises the MCP client per invocation so it can
+ * pass the current user's Bearer token on every tool call.
+ */
+async function mcp_tool_node(state: AgentState, config: RunnableConfig) {
+  const mcpClient = createMcpClient(state.userToken);
+  try {
+    const mcpTools = await mcpClient.getTools();
+    const toolNode = new ToolNode(mcpTools);
+    return await toolNode.invoke(state, config);
+  } finally {
+    await mcpClient.close();
+  }
 }
 
 // ─── Routing ─────────────────────────────────────────────────────────────────
@@ -302,8 +202,9 @@ function shouldContinue({ messages, copilotkit }: AgentState) {
     const actions = copilotkit?.actions;
     const toolCallName = lastMessage.tool_calls![0].name;
 
-    if (!actions || actions.every((action) => action.name !== toolCallName)) {
-      return "tool_node";
+    // If the tool call is NOT a frontend CopilotKit action → send to MCP tool node
+    if (!actions || actions.every((action: { name: string }) => action.name !== toolCallName)) {
+      return "mcp_tool_node";
     }
   }
 
@@ -314,9 +215,9 @@ function shouldContinue({ messages, copilotkit }: AgentState) {
 
 const workflow = new StateGraph(AgentStateAnnotation)
   .addNode("chat_node", chat_node)
-  .addNode("tool_node", new ToolNode(tools))
+  .addNode("mcp_tool_node", mcp_tool_node)
   .addEdge(START, "chat_node")
-  .addEdge("tool_node", "chat_node")
+  .addEdge("mcp_tool_node", "chat_node")
   .addConditionalEdges("chat_node", shouldContinue as any);
 
 const memory = new MemorySaver();
