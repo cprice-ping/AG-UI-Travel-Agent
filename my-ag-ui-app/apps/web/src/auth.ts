@@ -62,6 +62,6 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   },
 
   pages: {
-    signIn: "/", // redirect to home, which shows the login button
+    signIn: "/auth/signin",
   },
 });

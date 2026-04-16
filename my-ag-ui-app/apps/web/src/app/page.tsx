@@ -130,10 +130,11 @@ function TravelContent() {
     const left = Math.round(window.screenX + (window.outerWidth - width) / 2);
     const top = Math.round(window.screenY + (window.outerHeight - height) / 2);
 
-    // callbackUrl tells Auth.js where to redirect inside the popup after login.
-    const callbackUrl = encodeURIComponent("/auth/close");
+    // /auth/signin is an intermediate page that calls signIn() as a POST on
+    // mount — window.open() can only do GET, so we can't hit /api/auth/signin
+    // directly (Auth.js v5 requires POST for that endpoint).
     window.open(
-      `/api/auth/signin/pingone?callbackUrl=${callbackUrl}`,
+      "/auth/signin",
       "pingone-login",
       `width=${width},height=${height},left=${left},top=${top},popup=1,noreferrer`,
     );
