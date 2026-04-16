@@ -1,15 +1,26 @@
 /**
  * Travel MCP Server
  *
- * Exposes 4 travel tools via the MCP Streamable HTTP transport (2025-03-26 spec).
+ * Implements the MCP Streamable HTTP transport (spec 2025-11-25).
  * Every request is authenticated via a PingOne-issued JWT Bearer token validated
  * against PingOne's JWKS endpoint.
  *
  * Endpoints:
- *   POST   /mcp   — initiate session / send requests
- *   GET    /mcp   — SSE stream for server-to-client notifications
- *   DELETE /mcp   — terminate session
- *   GET    /health — liveness check
+ *   POST   /mcp                               — initiate session / send requests
+ *   GET    /mcp                               — SSE stream for server-to-client notifications
+ *   DELETE /mcp                               — terminate session
+ *   GET    /health                             — liveness check
+ *   GET    /.well-known/oauth-protected-resource — RFC 9728 resource metadata (§4.1)
+ *
+ * 2025-11-25 compliance notes:
+ *   §2.0.1 — Origin header validated; returns 403 for unknown browser origins.
+ *   §2.7   — MCP-Protocol-Version header validated on established sessions.
+ *   §4.2   — WWW-Authenticate includes resource_metadata URL on 401.
+ *   §9.2   — Bearer token validated on every request (not session-based auth).
+ *   Known limitation: token audience (aud) claim is not validated — the access
+ *   token is issued by PingOne to the web-app OAuth client, not directly to this
+ *   resource server.  Fixing this requires registering the MCP server as a
+ *   separate PingOne resource and having Auth.js request audience-bound tokens.
  */
 
 import "dotenv/config";
@@ -27,6 +38,25 @@ const PORT = parseInt(process.env.PORT ?? "3100", 10);
 const PINGONE_JWKS_URI = process.env.PINGONE_JWKS_URI ?? "";
 const PINGONE_ISSUER = process.env.PINGONE_ISSUER ?? "";
 const SKIP_AUTH = process.env.SKIP_AUTH === "true"; // allow disabling auth for local dev
+
+/** Public base URL of this server (used in resource metadata and WWW-Authenticate). */
+const PUBLIC_URL = (process.env.PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
+
+/**
+ * Comma-separated list of browser origins allowed to connect.
+ * Requests from unlisted origins are rejected with 403 (§2.0.1 DNS rebinding protection).
+ * Non-browser requests (no Origin header) are always allowed.
+ */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "http://localhost:3000")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/**
+ * Protocol versions this server supports.
+ * §2.7: respond 400 to requests advertising an unknown version.
+ */
+const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-11-25", "2025-03-26"]);
 
 // Lazily initialise JWKS set once so the key cache is shared across requests.
 let JWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
@@ -63,8 +93,15 @@ async function requireAuth(req: Request, res: Response): Promise<TokenClaims | n
     return { sub: "skip-auth" };
   }
 
+  const resourceMetadataUrl = `${PUBLIC_URL}/.well-known/oauth-protected-resource`;
+
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
+    // §4.2: include resource_metadata so compliant clients can perform discovery.
+    res.setHeader(
+      "WWW-Authenticate",
+      `Bearer resource_metadata="${resourceMetadataUrl}"`,
+    );
     res.status(401).json({ error: "Missing Bearer token" });
     return null;
   }
@@ -89,6 +126,11 @@ async function requireAuth(req: Request, res: Response): Promise<TokenClaims | n
     return claims;
   } catch (err) {
     console.error("[auth] ❌  JWT validation failed:", (err as Error).message);
+    const resourceMetadataUrl = `${PUBLIC_URL}/.well-known/oauth-protected-resource`;
+    res.setHeader(
+      "WWW-Authenticate",
+      `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}"`,
+    );
     res.status(401).json({ error: "Invalid or expired token" });
     return null;
   }
@@ -313,11 +355,29 @@ function registerTravelTools(server: McpServer, claims: TokenClaims) {
 
 const app = express();
 
+// §2.0.1 — DNS rebinding protection: validate Origin on all browser requests.
+// Non-browser (server-to-server) requests omit Origin and are always allowed.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+    res.status(403).json({ error: "Forbidden: Origin not allowed" });
+    return;
+  }
+  next();
+});
+
 app.use(
   cors({
-    origin: "*", // tighten in production
+    // Reflect the specific requesting origin (or skip if none) rather than wildcard.
+    origin: (origin, callback) => {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, origin ?? true);
+      } else {
+        callback(new Error("Origin not allowed"), false);
+      }
+    },
     exposedHeaders: ["mcp-session-id"],
-    allowedHeaders: ["content-type", "mcp-session-id", "authorization"],
+    allowedHeaders: ["content-type", "mcp-session-id", "authorization", "mcp-protocol-version", "last-event-id"],
   }),
 );
 app.use(express.json());
@@ -330,12 +390,36 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", sessions: transports.size });
 });
 
+// ── GET /.well-known/oauth-protected-resource — RFC 9728 §3 (spec §4.1) ──────
+// Allows MCP clients to discover the authorization server via standardised
+// metadata discovery, as required by the 2025-11-25 spec.
+app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+  res.json({
+    resource: `${PUBLIC_URL}/mcp`,
+    authorization_servers: PINGONE_ISSUER ? [PINGONE_ISSUER] : [],
+    scopes_supported: ["openid", "profile", "email"],
+    bearer_methods_supported: ["header"],
+  });
+});
+
 // ── POST /mcp — client initiates or continues a session ─────────────────────
 app.post("/mcp", async (req: Request, res: Response) => {
   const claims = await requireAuth(req, res);
   if (!claims) return;
 
+  // §2.7 — Validate MCP-Protocol-Version on established sessions.
+  // New sessions (no mcp-session-id) are the initialize exchange; version header
+  // is not yet available there.  Absent header on existing sessions is accepted
+  // for backward compat (treated as 2025-03-26 per spec).
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  const protocolVersion = req.headers["mcp-protocol-version"] as string | undefined;
+  if (sessionId && protocolVersion && !SUPPORTED_PROTOCOL_VERSIONS.has(protocolVersion)) {
+    res.status(400).json({
+      error: `Unsupported MCP-Protocol-Version: ${protocolVersion}. Supported: ${[...SUPPORTED_PROTOCOL_VERSIONS].join(", ")}`,
+    });
+    return;
+  }
+
   let transport = sessionId ? transports.get(sessionId) : undefined;
 
   if (!transport) {
