@@ -12,6 +12,8 @@ declare module "next-auth" {
   interface Session {
     /** Raw access token from PingOne — used as the MCP server Bearer token. */
     accessToken?: string;
+    /** PingOne preferred_username claim from the ID token. */
+    preferredUsername?: string;
   }
 }
 
@@ -41,12 +43,16 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
      * Persist the PingOne access_token inside the Auth.js JWT cookie so it
      * survives across page reloads without a database.
      */
-    async jwt({ token, account }) {
+    async jwt({ token, account, profile }) {
       if (account?.access_token) {
         token.accessToken = account.access_token;
         token.accessTokenExpires = account.expires_at
           ? account.expires_at * 1000
           : undefined;
+      }
+      // Capture preferred_username from the OIDC ID token profile on first sign-in.
+      if (profile?.preferred_username) {
+        token.preferredUsername = profile.preferred_username as string;
       }
       return token;
     },
@@ -57,6 +63,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
      */
     async session({ session, token }) {
       session.accessToken = token.accessToken as string | undefined;
+      session.preferredUsername = token.preferredUsername as string | undefined;
       return session;
     },
   },

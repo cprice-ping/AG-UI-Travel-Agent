@@ -133,10 +133,12 @@ function TravelContent() {
     // /auth/signin is an intermediate page that calls signIn() as a POST on
     // mount — window.open() can only do GET, so we can't hit /api/auth/signin
     // directly (Auth.js v5 requires POST for that endpoint).
+    // NOTE: do NOT include 'noreferrer' — it sets window.opener=null in the
+    // popup, breaking the postMessage back to this tab.
     window.open(
       "/auth/signin",
       "pingone-login",
-      `width=${width},height=${height},left=${left},top=${top},popup=1,noreferrer`,
+      `width=${width},height=${height},left=${left},top=${top},popup=1`,
     );
   }
 
@@ -380,7 +382,10 @@ function TravelContent() {
                 <div className="flex items-center gap-2 bg-emerald-500/20 border border-emerald-400/40 rounded-full px-3 py-1.5">
                   <span className="w-2 h-2 rounded-full bg-emerald-400" />
                   <span className="text-emerald-200 text-sm font-medium">
-                    {session.user?.name ?? session.user?.email ?? "Logged in"}
+                    {(session as { preferredUsername?: string } & typeof session)?.preferredUsername
+                      ?? session.user?.name
+                      ?? session.user?.email
+                      ?? "Logged in"}
                   </span>
                 </div>
                 <button
