@@ -70,6 +70,12 @@ const MCP_AUDIENCE = process.env.MCP_AUDIENCE !== undefined
   ? process.env.MCP_AUDIENCE
   : PUBLIC_URL;
 
+/** Base URL of the downstream Travel API. */
+const API_BASE_URL = (process.env.API_BASE_URL ?? "http://localhost:3200").replace(/\/$/, "");
+
+/** Shared API key sent in X-API-Key header on every API request. */
+const API_KEY = process.env.API_KEY ?? "";
+
 // Lazily initialise JWKS set once so the key cache is shared across requests.
 let JWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
 function getJWKS() {
@@ -153,6 +159,25 @@ async function requireAuth(req: Request, res: Response): Promise<TokenClaims | n
   }
 }
 
+// ─── API client helper ────────────────────────────────────────────────────────
+
+/**
+ * Calls a downstream Travel API endpoint with the shared API key.
+ * TODO: replace X-API-Key with RFC 8693 token exchange once the MCP server has
+ * its own PingOne client credentials and the API validates Bearer tokens.
+ */
+async function apiGet(path: string, params: Record<string, string>): Promise<unknown> {
+  const url = new URL(`${API_BASE_URL}${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString(), {
+    headers: { "X-API-Key": API_KEY },
+  });
+  if (!res.ok) {
+    throw new Error(`API ${path} returned ${res.status}: ${await res.text()}`);
+  }
+  return res.json();
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 function registerTravelTools(server: McpServer, claims: TokenClaims) {
@@ -177,39 +202,8 @@ function registerTravelTools(server: McpServer, claims: TokenClaims) {
     },
     async ({ origin, destination, departureDate }) => {
       logToolCall("searchFlights", { origin, destination, departureDate });
-      const flights = [
-        {
-          airline: "SkyJet Airways",
-          flightNumber: `SJ${Math.floor(Math.random() * 900) + 100}`,
-          departure: `${departureDate} 08:30`,
-          arrival: `${departureDate} 14:45`,
-          price: Math.floor(Math.random() * 400) + 250,
-          duration: "6h 15m",
-          origin,
-          destination,
-        },
-        {
-          airline: "Global Connect",
-          flightNumber: `GC${Math.floor(Math.random() * 900) + 100}`,
-          departure: `${departureDate} 13:00`,
-          arrival: `${departureDate} 19:20`,
-          price: Math.floor(Math.random() * 300) + 180,
-          duration: "6h 20m",
-          origin,
-          destination,
-        },
-        {
-          airline: "AirVoyage",
-          flightNumber: `AV${Math.floor(Math.random() * 900) + 100}`,
-          departure: `${departureDate} 21:15`,
-          arrival: `${departureDate} 03:30+1`,
-          price: Math.floor(Math.random() * 200) + 150,
-          duration: "6h 15m",
-          origin,
-          destination,
-        },
-      ];
-      return { content: [{ type: "text" as const, text: JSON.stringify(flights) }] };
+      const data = await apiGet("/flights", { origin, destination, departureDate });
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
     },
   );
 
@@ -227,36 +221,8 @@ function registerTravelTools(server: McpServer, claims: TokenClaims) {
     },
     async ({ destination, checkIn, checkOut }) => {
       logToolCall("searchHotels", { destination, checkIn, checkOut });
-      const hotels = [
-        {
-          name: `The Grand ${destination} Hotel`,
-          stars: 5,
-          pricePerNight: Math.floor(Math.random() * 200) + 200,
-          amenities: ["Pool", "Spa", "Restaurant", "Gym", "Free WiFi"],
-          location: `Central ${destination}`,
-          checkIn,
-          checkOut,
-        },
-        {
-          name: `${destination} Boutique Inn`,
-          stars: 4,
-          pricePerNight: Math.floor(Math.random() * 100) + 100,
-          amenities: ["Breakfast included", "Free WiFi", "Bar"],
-          location: `Old Town ${destination}`,
-          checkIn,
-          checkOut,
-        },
-        {
-          name: `Budget Stay ${destination}`,
-          stars: 3,
-          pricePerNight: Math.floor(Math.random() * 60) + 50,
-          amenities: ["Free WiFi", "24h Reception"],
-          location: `${destination} City Centre`,
-          checkIn,
-          checkOut,
-        },
-      ];
-      return { content: [{ type: "text" as const, text: JSON.stringify(hotels) }] };
+      const data = await apiGet("/hotels", { destination, checkIn, checkOut });
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
     },
   );
 
@@ -273,75 +239,8 @@ function registerTravelTools(server: McpServer, claims: TokenClaims) {
     },
     async ({ destination }) => {
       logToolCall("getDestinationInfo", { destination });
-      const knownDestinations: Record<
-        string,
-        { description: string; highlights: string[]; bestTime: string; currency: string; language: string }
-      > = {
-        paris: {
-          description: "The City of Light, known for art, fashion, gastronomy and culture.",
-          highlights: ["Eiffel Tower", "Louvre Museum", "Notre-Dame Cathedral", "Montmartre", "Seine River Cruises"],
-          bestTime: "April–June and September–November",
-          currency: "Euro (EUR)",
-          language: "French",
-        },
-        tokyo: {
-          description:
-            "A mesmerising blend of ultramodern and traditional, from neon-lit skyscrapers to historic temples.",
-          highlights: [
-            "Shibuya Crossing",
-            "Senso-ji Temple",
-            "Tsukiji Fish Market",
-            "Harajuku",
-            "Mount Fuji Day Trip",
-          ],
-          bestTime: "March–May (cherry blossom) and September–November",
-          currency: "Japanese Yen (JPY)",
-          language: "Japanese",
-        },
-        bali: {
-          description:
-            "An Indonesian island paradise with terraced rice paddies, volcanic mountains, and beautiful beaches.",
-          highlights: [
-            "Uluwatu Temple",
-            "Tegallalang Rice Terraces",
-            "Sacred Monkey Forest",
-            "Seminyak Beach",
-            "Ubud Arts Village",
-          ],
-          bestTime: "April–October (dry season)",
-          currency: "Indonesian Rupiah (IDR)",
-          language: "Balinese / Indonesian",
-        },
-        barcelona: {
-          description: "A vibrant coastal city bursting with Modernista architecture, beaches, and world-class cuisine.",
-          highlights: ["Sagrada Família", "Park Güell", "La Rambla", "Gothic Quarter", "Camp Nou"],
-          bestTime: "May–June and September–October",
-          currency: "Euro (EUR)",
-          language: "Catalan / Spanish",
-        },
-        "new york": {
-          description: "The city that never sleeps — a global hub for finance, art, fashion, and food.",
-          highlights: ["Central Park", "Metropolitan Museum", "Times Square", "Brooklyn Bridge", "High Line"],
-          bestTime: "April–June and September–November",
-          currency: "US Dollar (USD)",
-          language: "English",
-        },
-      };
-
-      const key = destination.toLowerCase();
-      const match = Object.entries(knownDestinations).find(([k]) => key.includes(k));
-      const info = match
-        ? { destination, ...match[1] }
-        : {
-            destination,
-            description: `${destination} is a wonderful travel destination with rich culture and unique experiences.`,
-            highlights: ["Local cuisine", "Cultural sites", "Natural scenery", "Shopping", "Nightlife"],
-            bestTime: "Spring or Autumn for mild weather",
-            currency: "Local currency",
-            language: "Local language",
-          };
-
-      return { content: [{ type: "text" as const, text: JSON.stringify(info) }] };
+      const data = await apiGet("/destination", { name: destination });
+      return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
     },
   );
 
@@ -357,13 +256,8 @@ function registerTravelTools(server: McpServer, claims: TokenClaims) {
     },
     async ({ location }) => {
       logToolCall("getWeather", { location });
-      const conditions = ["Sunny ☀️", "Partly cloudy ⛅", "Warm and clear 🌤️", "Mild with light breeze 🌬️"];
-      const condition = conditions[Math.floor(Math.random() * conditions.length)];
-      const tempC = Math.floor(Math.random() * 15) + 18;
-      const tempF = Math.round(tempC * 9 / 5 + 32);
-      const humidity = Math.floor(Math.random() * 30) + 40;
-      const result = `Weather in ${location}: ${condition}, ${tempC}°C (${tempF}°F). Humidity: ${humidity}%. Perfect for exploring!`;
-      return { content: [{ type: "text" as const, text: result }] };
+      const data = await apiGet("/weather", { location }) as { summary: string };
+      return { content: [{ type: "text" as const, text: data.summary ?? JSON.stringify(data) }] };
     },
   );
 }
