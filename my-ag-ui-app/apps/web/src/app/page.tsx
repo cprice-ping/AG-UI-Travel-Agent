@@ -65,8 +65,8 @@ type AgentState = {
   travelDates: TravelDates;
   flightResults: FlightResult[];
   hotelResults: HotelResult[];
-  /** PingOne Bearer token — forwarded to the MCP server for each tool call. */
-  userToken: string;
+  /** Per-server PingOne Bearer tokens — keyed by server name matching MCP_SERVERS on the agent. */
+  userTokens: Record<string, string>;
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -151,15 +151,18 @@ function TravelContent() {
       travelDates: { start: "", end: "" },
       flightResults: [],
       hotelResults: [],
-      userToken: accessToken,
+      userTokens: { travel: accessToken },
     },
   });
 
-  // Sync userToken into agent state whenever the session changes.
+  // Sync the travel server token into agent state whenever the session changes.
   // Must be in useEffect — calling setState in the render body is a React
   // anti-pattern that can cause loops or silently drop the update.
   useEffect(() => {
-    setState((prev) => ({ ...prev, userToken: accessToken } as AgentState));
+    setState((prev) => ({
+      ...prev,
+      userTokens: { ...prev.userTokens, travel: accessToken },
+    } as AgentState));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accessToken]);
 

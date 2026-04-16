@@ -2,9 +2,9 @@
  * Travel Agent - powered by Gemini via LangChain.
  * Helps users plan trips with destinations, itineraries, flights, hotels and weather.
  *
- * Tools are served by an external MCP server (HTTP Streaming transport).
- * Each invocation authenticates using the PingOne access token stored in
- * the agent state, forwarded as a Bearer token to the MCP server.
+ * Tools are served by external MCP servers (HTTP Streaming transport).
+ * Each invocation authenticates using a per-server PingOne access token stored
+ * in agent state, forwarded as a Bearer token to the relevant MCP server.
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
@@ -78,31 +78,65 @@ const AgentStateAnnotation = Annotation.Root({
   travelDates: Annotation<TravelDates>,
   flightResults: Annotation<FlightResult[]>,
   hotelResults: Annotation<HotelResult[]>,
-  /** PingOne access token forwarded from the browser session (set by the frontend). */
-  userToken: Annotation<string>,
+  /**
+   * Per-server PingOne access tokens, keyed by server name matching MCP_SERVERS.
+   * e.g. { travel: "eyJ...", weather: "eyJ..." }
+   * The frontend acquires each token via the appropriate PingOne scope and syncs
+   * it here.  Only servers with a non-empty token will be connected.
+   */
+  userTokens: Annotation<Record<string, string>>,
 });
 
 export type AgentState = typeof AgentStateAnnotation.State;
 
-// ─── MCP client factory ───────────────────────────────────────────────────────
-
-const MCP_SERVER_URL = process.env.MCP_SERVER_URL ?? "http://localhost:3100/mcp";
+// ─── MCP server config ───────────────────────────────────────────────────────
 
 /**
- * Creates a short-lived MCP client authenticated with the supplied Bearer token.
+ * MCP server registry — a map of server name → URL.
+ * Configure via MCP_SERVERS env var as JSON:
+ *   MCP_SERVERS={"travel":"http://localhost:3100/mcp","weather":"http://localhost:3200/mcp"}
+ * Falls back to MCP_SERVER_URL for single-server backward compatibility.
+ */
+function parseMcpServers(): Record<string, string> {
+  const raw = process.env.MCP_SERVERS;
+  if (raw) {
+    try {
+      return JSON.parse(raw) as Record<string, string>;
+    } catch {
+      console.error("[agent] Failed to parse MCP_SERVERS env var — falling back to MCP_SERVER_URL");
+    }
+  }
+  return { travel: process.env.MCP_SERVER_URL ?? "http://localhost:3100/mcp" };
+}
+
+const MCP_SERVERS = parseMcpServers();
+
+// ─── MCP client factory ───────────────────────────────────────────────────────
+
+/**
+ * Creates a short-lived MCP client connecting to every server that has a token.
+ * Servers without a token in the map are skipped entirely.
  * The caller is responsible for calling client.close() when done.
  */
-function createMcpClient(token: string): MultiServerMCPClient {
-  return new MultiServerMCPClient({
-    mcpServers: {
-      travel: {
-        url: MCP_SERVER_URL,
+function createMcpClient(tokens: Record<string, string>): MultiServerMCPClient {
+  const mcpServers: Record<string, {
+    url: string;
+    headers: Record<string, string>;
+    automaticSSEFallback: boolean;
+  }> = {};
+  for (const [name, url] of Object.entries(MCP_SERVERS)) {
+    const token = tokens[name];
+    if (token) {
+      mcpServers[name] = {
+        url,
         headers: { Authorization: `Bearer ${token}` },
-        // Disable SSE fallback — our server speaks Streamable HTTP natively.
+        // Our servers speak Streamable HTTP natively — no SSE fallback needed.
         automaticSSEFallback: false,
-      },
-    },
-    // Surface errors so they appear in agent logs — do not hide MCP failures.
+      };
+    }
+  }
+  return new MultiServerMCPClient({
+    mcpServers,
     onConnectionError: "throw",
   });
 }
@@ -119,22 +153,34 @@ const toolsCache = new Map<string, {
 
 const TOOLS_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
+/** Stable cache key derived from the token map (sorted by server name). */
+function tokensKey(tokens: Record<string, string>): string {
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(tokens)
+        .filter(([, v]) => Boolean(v))
+        .sort(([a], [b]) => a.localeCompare(b)),
+    ),
+  );
+}
+
 /**
- * Returns MCP tool schemas for the given token, reusing a cached result when
- * available. On cache miss, opens a short-lived connection, fetches the list,
- * then closes it immediately — so chat_node never holds a persistent session.
+ * Returns MCP tool schemas for the given token map, reusing a cached result
+ * when available. On cache miss, opens a short-lived connection, fetches the
+ * list, then closes it — so chat_node never holds a persistent session.
  */
 async function getCachedMcpTools(
-  token: string,
+  tokens: Record<string, string>,
 ): Promise<Awaited<ReturnType<MultiServerMCPClient["getTools"]>>> {
-  const cached = toolsCache.get(token);
+  const key = tokensKey(tokens);
+  const cached = toolsCache.get(key);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.tools;
   }
-  const client = createMcpClient(token);
+  const client = createMcpClient(tokens);
   try {
     const tools = await client.getTools();
-    toolsCache.set(token, { tools, expiresAt: Date.now() + TOOLS_CACHE_TTL_MS });
+    toolsCache.set(key, { tools, expiresAt: Date.now() + TOOLS_CACHE_TTL_MS });
     return tools;
   } finally {
     await client.close();
@@ -144,15 +190,14 @@ async function getCachedMcpTools(
 // ─── Chat node ───────────────────────────────────────────────────────────────
 
 async function chat_node(state: AgentState, config: RunnableConfig) {
-  // Only contact the MCP server when the user has authenticated.
-  // Without a token the server will reject the request (401), and we don't
-  // want to describe the tools in the system prompt when they can't be called.
+  // Only contact MCP servers that have a token in state.
   let mcpTools: Awaited<ReturnType<MultiServerMCPClient["getTools"]>> = [];
-  const isAuthenticated = Boolean(state.userToken);
+  const tokens = state.userTokens ?? {};
+  const isAuthenticated = Object.values(tokens).some(Boolean);
 
   if (isAuthenticated) {
     try {
-      mcpTools = await getCachedMcpTools(state.userToken);
+      mcpTools = await getCachedMcpTools(tokens);
     } catch (err) {
       console.error("[agent] MCP tool load failed:", (err as Error).message);
     }
@@ -184,14 +229,10 @@ Current travel plan:
 - Itinerary days: ${(state.itinerary ?? []).length}
 `.trim();
 
-  // Only describe backend tools when they are actually bound — prevents Gemini
-  // from answering from memory when tools aren't available.
-  const backendToolsSection = isAuthenticated
-    ? `BACKEND TOOLS — call these to fetch live data (results appear as UI cards):
-- getDestinationInfo(destination)
-- searchFlights(origin, destination, departureDate)
-- searchHotels(destination, checkIn, checkOut)
-- getWeather(location)`
+  // Derive the backend tools section from actual loaded tools so the prompt
+  // stays accurate when servers are added/removed without editing this file.
+  const backendToolsSection = isAuthenticated && mcpTools.length > 0
+    ? `BACKEND TOOLS — call these to fetch live data (results appear as UI cards):\n${mcpTools.map((t) => `- ${t.name}`).join("\n")}`
     : `BACKEND TOOLS — NOT available. The user is not logged in.
 Do NOT answer flight, hotel, or weather queries from memory.
 Instead, tell the user: "Please log in with PingOne to enable live travel search."\nYou may still help with general destination advice.`;
@@ -257,13 +298,12 @@ ${travelContext}`,
  * pass the current user's Bearer token on every tool call.
  */
 async function mcp_tool_node(state: AgentState, config: RunnableConfig) {
-  if (!state.userToken) {
+  const tokens = state.userTokens ?? {};
+  if (!Object.values(tokens).some(Boolean)) {
     // Guard: should not reach here unauthenticated, but return an error message
     // as a ToolMessage so the agent can surface it to the user.
     const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
     const toolCallId = lastMessage.tool_calls?.[0]?.id ?? "unknown";
-    const { HumanMessage } = await import("@langchain/core/messages");
-    void HumanMessage; // unused, just triggering the import path check
     const { ToolMessage } = await import("@langchain/core/messages");
     return {
       messages: [
@@ -275,7 +315,7 @@ async function mcp_tool_node(state: AgentState, config: RunnableConfig) {
     };
   }
 
-  const mcpClient = createMcpClient(state.userToken);
+  const mcpClient = createMcpClient(tokens);
   try {
     const mcpTools = await mcpClient.getTools();
     const toolNode = new ToolNode(mcpTools);
