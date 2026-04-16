@@ -58,6 +58,14 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "http://localhost:3000")
  */
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-11-25", "2025-03-26"]);
 
+/**
+ * Audience expected in the access token.
+ * When PingOne grants the mcp:travel_tools scope it sets aud to the
+ * scope's resource URL (which matches the scope name by default in PingOne).
+ * Set MCP_AUDIENCE in .env to override; leave empty to skip aud validation.
+ */
+const MCP_AUDIENCE = process.env.MCP_AUDIENCE ?? "mcp:travel_tools";
+
 // Lazily initialise JWKS set once so the key cache is shared across requests.
 let JWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
 function getJWKS() {
@@ -78,6 +86,7 @@ type TokenClaims = {
   name?: string;
   email?: string;
   scope?: string;
+  aud?: string | string[];
   iss?: string;
   exp?: number;
 };
@@ -110,6 +119,9 @@ async function requireAuth(req: Request, res: Response): Promise<TokenClaims | n
   try {
     const { payload } = await jwtVerify(token, getJWKS(), {
       issuer: PINGONE_ISSUER || undefined,
+      // §9.2/§11.8: validate aud so tokens issued for other services are rejected.
+      // Only enforce when MCP_AUDIENCE is configured.
+      ...(MCP_AUDIENCE ? { audience: MCP_AUDIENCE } : {}),
     });
 
     // Decode all claims for logging (jwtVerify already verified signature).
@@ -397,7 +409,7 @@ app.get("/.well-known/oauth-protected-resource", (_req, res) => {
   res.json({
     resource: `${PUBLIC_URL}/mcp`,
     authorization_servers: PINGONE_ISSUER ? [PINGONE_ISSUER] : [],
-    scopes_supported: ["openid", "profile", "email"],
+    scopes_supported: ["openid", "profile", "email", "mcp:travel_tools"],
     bearer_methods_supported: ["header"],
   });
 });

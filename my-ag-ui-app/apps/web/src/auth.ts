@@ -29,9 +29,11 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       clientSecret: process.env.AUTH_PINGONE_CLIENT_SECRET,
       authorization: {
         params: {
-          // Request openid + profile + email scopes.
-          // Add any PingOne custom scopes your app needs here.
-          scope: "openid profile email",
+          // Request openid + profile + email + custom MCP audience scope.
+          // mcp:travel_tools causes PingOne to mint the access token with
+          // an aud claim that includes the MCP server resource, enabling
+          // the server to validate the token was issued specifically for it.
+          scope: "openid profile email mcp:travel_tools",
           response_type: "code",
         },
       },
