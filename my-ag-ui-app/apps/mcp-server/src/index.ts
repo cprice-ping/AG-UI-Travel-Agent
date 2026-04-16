@@ -348,16 +348,12 @@ app.post("/mcp", async (req: Request, res: Response) => {
       },
     });
 
-    transport.onclose = () => {
-      // Cleaned up via the DELETE handler, but also handle unexpected closes.
-      for (const [id, t] of transports) {
-        if (t === transport) {
-          transports.delete(id);
-          console.log(`[MCP] Session closed: ${id}`);
-          break;
-        }
-      }
-    };
+    // NOTE: Do NOT delete the session from the map on transport.onclose.
+    // In Streamable HTTP the GET SSE stream is ephemeral — the client closes
+    // it after receiving the initial response, then continues sending tool
+    // calls via POST with the same session-id.  Evicting the session here
+    // would force a brand-new session (and a new auth round-trip) for every
+    // tool call.  Explicit cleanup is handled by the DELETE /mcp handler.
 
     const server = new McpServer({ name: "travel-mcp-server", version: "1.0.0" });
     registerTravelTools(server, claims);
