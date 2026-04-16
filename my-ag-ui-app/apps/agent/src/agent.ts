@@ -131,10 +131,11 @@ async function chat_node(state: AgentState, config: RunnableConfig) {
     model: "gemini-2.5-flash",
     temperature: 0.7,
     apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
-    // Disable thinking tokens — gemini-2.5-flash returns empty `parts` arrays
-    // in thinking chunks that @langchain/google-genai 2.1.27 can't handle,
-    // causing "Cannot read properties of undefined (reading 'parts')".
-    thinkingConfig: { thinkingBudget: 0 },
+    // Allow a moderate thinking budget so the model can reason about when to
+    // call tools. Budget 0 disabled tool selection reasoning entirely.
+    // The original 'parts' crash was caused by very large thinking responses;
+    // capping at 2048 keeps thinking tokens small enough to avoid it.
+    thinkingConfig: { thinkingBudget: 2048 },
   });
 
   const allTools = [
@@ -186,10 +187,34 @@ RULES:
 ${travelContext}`,
   });
 
-  const response = await modelWithTools.invoke(
-    [systemMessage, ...state.messages],
-    config,
-  );
+  let response;
+  try {
+    response = await modelWithTools.invoke(
+      [systemMessage, ...state.messages],
+      config,
+    );
+  } catch (err) {
+    const msg = (err as Error).message ?? "";
+    // Gemini 2.5 Flash thinking chunks occasionally have empty `parts` arrays
+    // that @langchain/google-genai 2.1.27 can't handle. Retry once with
+    // thinking disabled as a fallback.
+    if (msg.includes("parts")) {
+      console.warn("[agent] Thinking chunk error — retrying with thinkingBudget:0");
+      const fallbackModel = new ChatGoogleGenerativeAI({
+        model: "gemini-2.5-flash",
+        temperature: 0.7,
+        apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
+        thinkingConfig: { thinkingBudget: 0 },
+      });
+      const fallbackWithTools = fallbackModel.bindTools!(allTools);
+      response = await fallbackWithTools.invoke(
+        [systemMessage, ...state.messages],
+        config,
+      );
+    } else {
+      throw err;
+    }
+  }
 
   return { messages: response };
 }
