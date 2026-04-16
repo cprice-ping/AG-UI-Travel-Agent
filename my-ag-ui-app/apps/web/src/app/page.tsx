@@ -109,27 +109,34 @@ function TravelContent() {
   /**
    * Open PingOne login in a centred popup window so the main tab — and all
    * agent state (destinations, itinerary, chat history) — is preserved.
-   * When the popup closes, refresh the Auth.js session in the background.
+   * After a successful callback, Auth.js redirects the popup to /auth/close,
+   * which posts a message back here and calls window.close().
    */
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+      if (event.origin !== window.location.origin) return;
+      if (event.data === "auth:complete") {
+        refreshSession(); // re-fetches the Auth.js session without a page reload
+      }
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function handleLogin() {
     const width = 520;
     const height = 640;
     const left = Math.round(window.screenX + (window.outerWidth - width) / 2);
     const top = Math.round(window.screenY + (window.outerHeight - height) / 2);
 
-    const popup = window.open(
-      "/api/auth/signin/pingone",
+    // callbackUrl tells Auth.js where to redirect inside the popup after login.
+    const callbackUrl = encodeURIComponent("/auth/close");
+    window.open(
+      `/api/auth/signin/pingone?callbackUrl=${callbackUrl}`,
       "pingone-login",
       `width=${width},height=${height},left=${left},top=${top},popup=1,noreferrer`,
     );
-
-    // Poll until the popup closes, then pull the new session cookie.
-    const timer = setInterval(() => {
-      if (popup?.closed) {
-        clearInterval(timer);
-        refreshSession(); // re-fetches the Auth.js session without a page reload
-      }
-    }, 500);
   }
 
   const { state, setState } = useCoAgent<AgentState>({
