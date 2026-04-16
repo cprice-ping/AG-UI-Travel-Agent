@@ -131,6 +131,10 @@ async function chat_node(state: AgentState, config: RunnableConfig) {
     model: "gemini-2.5-flash",
     temperature: 0.7,
     apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
+    // Disable thinking tokens — gemini-2.5-flash returns empty `parts` arrays
+    // in thinking chunks that @langchain/google-genai 2.1.27 can't handle,
+    // causing "Cannot read properties of undefined (reading 'parts')".
+    thinkingConfig: { thinkingBudget: 0 },
   });
 
   const allTools = [

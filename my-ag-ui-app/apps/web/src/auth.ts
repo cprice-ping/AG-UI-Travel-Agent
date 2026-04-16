@@ -50,9 +50,17 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           ? account.expires_at * 1000
           : undefined;
       }
-      // Capture preferred_username from the OIDC ID token profile on first sign-in.
-      if (profile?.preferred_username) {
-        token.preferredUsername = profile.preferred_username as string;
+      // Capture the display name from the OIDC profile on first sign-in.
+      // PingOne may use preferred_username, username, name, or given_name
+      // depending on the environment attribute mappings.
+      if (profile) {
+        const p = profile as Record<string, unknown>;
+        token.preferredUsername =
+          (p.preferred_username as string) ??
+          (p.username as string) ??
+          (p.name as string) ??
+          (p.given_name as string) ??
+          undefined;
       }
       return token;
     },
