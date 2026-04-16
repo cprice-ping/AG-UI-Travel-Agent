@@ -107,6 +107,40 @@ function createMcpClient(token: string): MultiServerMCPClient {
   });
 }
 
+// ─── Tool schema cache ───────────────────────────────────────────────────────
+
+/** Cached tool schemas keyed by Bearer token. Tools contain only schema info
+ * used for model binding — execution always goes through mcp_tool_node which
+ * creates its own fresh connection. */
+const toolsCache = new Map<string, {
+  tools: Awaited<ReturnType<MultiServerMCPClient["getTools"]>>;
+  expiresAt: number;
+}>();
+
+const TOOLS_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+
+/**
+ * Returns MCP tool schemas for the given token, reusing a cached result when
+ * available. On cache miss, opens a short-lived connection, fetches the list,
+ * then closes it immediately — so chat_node never holds a persistent session.
+ */
+async function getCachedMcpTools(
+  token: string,
+): Promise<Awaited<ReturnType<MultiServerMCPClient["getTools"]>>> {
+  const cached = toolsCache.get(token);
+  if (cached && Date.now() < cached.expiresAt) {
+    return cached.tools;
+  }
+  const client = createMcpClient(token);
+  try {
+    const tools = await client.getTools();
+    toolsCache.set(token, { tools, expiresAt: Date.now() + TOOLS_CACHE_TTL_MS });
+    return tools;
+  } finally {
+    await client.close();
+  }
+}
+
 // ─── Chat node ───────────────────────────────────────────────────────────────
 
 async function chat_node(state: AgentState, config: RunnableConfig) {
@@ -117,13 +151,10 @@ async function chat_node(state: AgentState, config: RunnableConfig) {
   const isAuthenticated = Boolean(state.userToken);
 
   if (isAuthenticated) {
-    const mcpClient = createMcpClient(state.userToken);
     try {
-      mcpTools = await mcpClient.getTools();
+      mcpTools = await getCachedMcpTools(state.userToken);
     } catch (err) {
       console.error("[agent] MCP tool load failed:", (err as Error).message);
-    } finally {
-      await mcpClient.close();
     }
   }
 
