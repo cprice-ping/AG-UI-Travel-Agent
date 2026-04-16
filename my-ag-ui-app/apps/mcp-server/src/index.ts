@@ -59,12 +59,16 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "http://localhost:3000")
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-11-25", "2025-03-26"]);
 
 /**
- * Audience expected in the access token.
- * When PingOne grants the mcp:travel_tools scope it sets aud to the
- * scope's resource URL (which matches the scope name by default in PingOne).
- * Set MCP_AUDIENCE in .env to override; leave empty to skip aud validation.
+ * Audience expected in the access token (§9.2/§11.8).
+ * In PingOne, the custom scope 'mcp:travel_tools' belongs to a Resource whose
+ * audience URL is the MCP server's own URL. PingOne puts that Resource audience
+ * in the 'aud' claim — not the scope name itself.
+ * Defaults to PUBLIC_URL so the two values stay in sync automatically.
+ * Set MCP_AUDIENCE= (empty) in .env to disable audience validation.
  */
-const MCP_AUDIENCE = process.env.MCP_AUDIENCE ?? "mcp:travel_tools";
+const MCP_AUDIENCE = process.env.MCP_AUDIENCE !== undefined
+  ? process.env.MCP_AUDIENCE
+  : PUBLIC_URL;
 
 // Lazily initialise JWKS set once so the key cache is shared across requests.
 let JWKS: ReturnType<typeof createRemoteJWKSet> | null = null;
