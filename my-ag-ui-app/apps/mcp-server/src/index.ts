@@ -134,9 +134,10 @@ async function requireAuth(req: Request, res: Response): Promise<TokenClaims | n
       claims.preferred_username ?? claims.username ?? claims.name ?? claims.email ?? claims.sub ?? "unknown";
     const expiry = claims.exp ? new Date(claims.exp * 1000).toISOString() : "unknown";
     const scopes = claims.scope ?? (payload.scope as string | undefined) ?? "";
+    const aud = Array.isArray(claims.aud) ? claims.aud.join(", ") : (claims.aud ?? "none");
 
     console.log(
-      `[auth] ✅  Token valid | sub=${claims.sub} | user=${displayName} | scopes=[${scopes}] | expires=${expiry}`,
+      `[auth] ✅  Token valid | sub=${claims.sub} | user=${displayName} | aud=[${aud}] | scopes=[${scopes}] | expires=${expiry}`,
     );
 
     return claims;
