@@ -3,6 +3,7 @@
 import { useCoAgent, useCopilotAction } from "@copilotkit/react-core";
 import { CopilotKitCSSProperties, CopilotSidebar } from "@copilotkit/react-ui";
 import { useSession, signIn, signOut } from "next-auth/react";
+import { useEffect } from "react";
 
 // ─── Types (mirror agent state) ──────────────────────────────────────────────
 
@@ -118,11 +119,13 @@ function TravelContent() {
     },
   });
 
-  // Keep userToken in sync when the session changes (e.g. after login)
-  const prevToken = state.userToken;
-  if (prevToken !== accessToken) {
+  // Sync userToken into agent state whenever the session changes.
+  // Must be in useEffect — calling setState in the render body is a React
+  // anti-pattern that can cause loops or silently drop the update.
+  useEffect(() => {
     setState((prev) => ({ ...prev, userToken: accessToken } as AgentState));
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accessToken]);
 
   // ── Frontend actions the agent can call ────────────────────────────────────
 
