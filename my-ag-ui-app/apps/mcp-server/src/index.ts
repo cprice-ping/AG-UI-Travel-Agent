@@ -16,7 +16,7 @@ import "dotenv/config";
 import { randomUUID } from "crypto";
 import express, { type Request, type Response } from "express";
 import cors from "cors";
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { createRemoteJWKSet, jwtVerify, decodeJwt } from "jose";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -40,31 +40,70 @@ function getJWKS() {
 
 // ─── JWT validation ───────────────────────────────────────────────────────────
 
-async function requireAuth(req: Request, res: Response): Promise<boolean> {
-  if (SKIP_AUTH) return true;
+/** Claims we log from every incoming token. */
+type TokenClaims = {
+  sub?: string;
+  preferred_username?: string;
+  username?: string;
+  name?: string;
+  email?: string;
+  scope?: string;
+  iss?: string;
+  exp?: number;
+};
+
+/**
+ * Validates the Bearer token in the Authorization header.
+ * On success, returns the decoded claims so callers can log them.
+ * On failure, writes the 401 response and returns null.
+ */
+async function requireAuth(req: Request, res: Response): Promise<TokenClaims | null> {
+  if (SKIP_AUTH) {
+    console.log("[auth] ⚠️  Auth disabled (SKIP_AUTH=true)");
+    return { sub: "skip-auth" };
+  }
 
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
     res.status(401).json({ error: "Missing Bearer token" });
-    return false;
+    return null;
   }
 
   const token = authHeader.slice(7);
   try {
-    await jwtVerify(token, getJWKS(), {
+    const { payload } = await jwtVerify(token, getJWKS(), {
       issuer: PINGONE_ISSUER || undefined,
     });
-    return true;
+
+    // Decode all claims for logging (jwtVerify already verified signature).
+    const claims = decodeJwt(token) as TokenClaims;
+    const displayName =
+      claims.preferred_username ?? claims.username ?? claims.name ?? claims.email ?? claims.sub ?? "unknown";
+    const expiry = claims.exp ? new Date(claims.exp * 1000).toISOString() : "unknown";
+    const scopes = claims.scope ?? (payload.scope as string | undefined) ?? "";
+
+    console.log(
+      `[auth] ✅  Token valid | sub=${claims.sub} | user=${displayName} | scopes=[${scopes}] | expires=${expiry}`,
+    );
+
+    return claims;
   } catch (err) {
-    console.error("JWT validation failed:", (err as Error).message);
+    console.error("[auth] ❌  JWT validation failed:", (err as Error).message);
     res.status(401).json({ error: "Invalid or expired token" });
-    return false;
+    return null;
   }
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
-function registerTravelTools(server: McpServer) {
+function registerTravelTools(server: McpServer, claims: TokenClaims) {
+  const caller =
+    claims.preferred_username ?? claims.username ?? claims.name ?? claims.email ?? claims.sub ?? "unknown";
+
+  function logToolCall(name: string, args: Record<string, unknown>) {
+    console.log(`[tool] 🔧  ${name} | caller=${caller} | args=${JSON.stringify(args)}`);
+  }
+
   // ── searchFlights ──────────────────────────────────────────────────────────
   server.registerTool(
     "searchFlights",
@@ -78,6 +117,7 @@ function registerTravelTools(server: McpServer) {
       }),
     },
     async ({ origin, destination, departureDate }) => {
+      logToolCall("searchFlights", { origin, destination, departureDate });
       const flights = [
         {
           airline: "SkyJet Airways",
@@ -127,6 +167,7 @@ function registerTravelTools(server: McpServer) {
       }),
     },
     async ({ destination, checkIn, checkOut }) => {
+      logToolCall("searchHotels", { destination, checkIn, checkOut });
       const hotels = [
         {
           name: `The Grand ${destination} Hotel`,
@@ -172,6 +213,7 @@ function registerTravelTools(server: McpServer) {
       }),
     },
     async ({ destination }) => {
+      logToolCall("getDestinationInfo", { destination });
       const knownDestinations: Record<
         string,
         { description: string; highlights: string[]; bestTime: string; currency: string; language: string }
@@ -255,6 +297,7 @@ function registerTravelTools(server: McpServer) {
       }),
     },
     async ({ location }) => {
+      logToolCall("getWeather", { location });
       const conditions = ["Sunny ☀️", "Partly cloudy ⛅", "Warm and clear 🌤️", "Mild with light breeze 🌬️"];
       const condition = conditions[Math.floor(Math.random() * conditions.length)];
       const tempC = Math.floor(Math.random() * 15) + 18;
@@ -289,7 +332,8 @@ app.get("/health", (_req, res) => {
 
 // ── POST /mcp — client initiates or continues a session ─────────────────────
 app.post("/mcp", async (req: Request, res: Response) => {
-  if (!(await requireAuth(req, res))) return;
+  const claims = await requireAuth(req, res);
+  if (!claims) return;
 
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let transport = sessionId ? transports.get(sessionId) : undefined;
@@ -316,7 +360,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
     };
 
     const server = new McpServer({ name: "travel-mcp-server", version: "1.0.0" });
-    registerTravelTools(server);
+    registerTravelTools(server, claims);
     await server.connect(transport);
   }
 
@@ -325,7 +369,8 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
 // ── GET /mcp — SSE stream for server-initiated notifications ─────────────────
 app.get("/mcp", async (req: Request, res: Response) => {
-  if (!(await requireAuth(req, res))) return;
+  const claims = await requireAuth(req, res);
+  if (!claims) return;
 
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId) {
@@ -344,7 +389,8 @@ app.get("/mcp", async (req: Request, res: Response) => {
 
 // ── DELETE /mcp — client terminates a session ────────────────────────────────
 app.delete("/mcp", async (req: Request, res: Response) => {
-  if (!(await requireAuth(req, res))) return;
+  const claims = await requireAuth(req, res);
+  if (!claims) return;
 
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId) {
