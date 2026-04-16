@@ -92,30 +92,39 @@ const MCP_SERVER_URL = process.env.MCP_SERVER_URL ?? "http://localhost:3100/mcp"
  * Creates a short-lived MCP client authenticated with the supplied Bearer token.
  * The caller is responsible for calling client.close() when done.
  */
-function createMcpClient(token?: string): MultiServerMCPClient {
+function createMcpClient(token: string): MultiServerMCPClient {
   return new MultiServerMCPClient({
     mcpServers: {
       travel: {
         url: MCP_SERVER_URL,
-        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+        headers: { Authorization: `Bearer ${token}` },
         // Disable SSE fallback — our server speaks Streamable HTTP natively.
         automaticSSEFallback: false,
       },
     },
-    onConnectionError: "ignore", // degrade gracefully if MCP server is unavailable
+    // Surface errors so they appear in agent logs — do not hide MCP failures.
+    onConnectionError: "throw",
   });
 }
 
 // ─── Chat node ───────────────────────────────────────────────────────────────
 
 async function chat_node(state: AgentState, config: RunnableConfig) {
-  const mcpClient = createMcpClient(state.userToken);
+  // Only contact the MCP server when the user has authenticated.
+  // Without a token the server will reject the request (401), and we don't
+  // want to describe the tools in the system prompt when they can't be called.
   let mcpTools: Awaited<ReturnType<MultiServerMCPClient["getTools"]>> = [];
+  const isAuthenticated = Boolean(state.userToken);
 
-  try {
-    mcpTools = await mcpClient.getTools();
-  } catch (err) {
-    console.warn("[agent] MCP server unavailable — proceeding without tools:", (err as Error).message);
+  if (isAuthenticated) {
+    const mcpClient = createMcpClient(state.userToken);
+    try {
+      mcpTools = await mcpClient.getTools();
+    } catch (err) {
+      console.error("[agent] MCP tool load failed:", (err as Error).message);
+    } finally {
+      await mcpClient.close();
+    }
   }
 
   const model = new ChatGoogleGenerativeAI({
@@ -137,17 +146,24 @@ Current travel plan:
 - Travel dates: ${JSON.stringify(state.travelDates ?? {})}
 - Budget: ${JSON.stringify(state.budget ?? {})}
 - Itinerary days: ${(state.itinerary ?? []).length}
-${state.userToken ? "- Authenticated: yes (MCP tools available)" : "- Authenticated: no (log in to enable travel search tools)"}
 `.trim();
 
-  const systemMessage = new SystemMessage({
-    content: `You are an expert AI travel agent with access to both backend tools (via MCP) and frontend actions.
-
-BACKEND TOOLS — served by the MCP server, call these to fetch live data:
+  // Only describe backend tools when they are actually bound — prevents Gemini
+  // from answering from memory when tools aren't available.
+  const backendToolsSection = isAuthenticated
+    ? `BACKEND TOOLS — call these to fetch live data (results appear as UI cards):
 - getDestinationInfo(destination)
 - searchFlights(origin, destination, departureDate)
 - searchHotels(destination, checkIn, checkOut)
-- getWeather(location)
+- getWeather(location)`
+    : `BACKEND TOOLS — NOT available. The user is not logged in.
+Do NOT answer flight, hotel, or weather queries from memory.
+Instead, tell the user: "Please log in with PingOne to enable live travel search."\nYou may still help with general destination advice.`;
+
+  const systemMessage = new SystemMessage({
+    content: `You are an expert AI travel agent.
+
+${backendToolsSection}
 
 FRONTEND ACTIONS (call these to update the live travel dashboard on the left):
 - addDestination(name, country, description, emoji)
@@ -160,9 +176,8 @@ FRONTEND ACTIONS (call these to update the live travel dashboard on the left):
 RULES:
 1. When a destination is confirmed, call addDestination AND setTravelDates immediately.
 2. When building an itinerary, call addItineraryDay for EACH day.
-3. Tool results appear as UI cards — do NOT repeat their content in text. Say "Here are some options!" instead.
+3. Tool results appear as UI cards — do NOT repeat their content in text.
 4. Keep replies short and conversational.
-5. If not authenticated, tell the user to log in to use flight/hotel search.
 
 ${travelContext}`,
   });
@@ -172,7 +187,6 @@ ${travelContext}`,
     config,
   );
 
-  await mcpClient.close();
   return { messages: response };
 }
 
@@ -183,6 +197,24 @@ ${travelContext}`,
  * pass the current user's Bearer token on every tool call.
  */
 async function mcp_tool_node(state: AgentState, config: RunnableConfig) {
+  if (!state.userToken) {
+    // Guard: should not reach here unauthenticated, but return an error message
+    // as a ToolMessage so the agent can surface it to the user.
+    const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
+    const toolCallId = lastMessage.tool_calls?.[0]?.id ?? "unknown";
+    const { HumanMessage } = await import("@langchain/core/messages");
+    void HumanMessage; // unused, just triggering the import path check
+    const { ToolMessage } = await import("@langchain/core/messages");
+    return {
+      messages: [
+        new ToolMessage({
+          tool_call_id: toolCallId,
+          content: "Authentication required. Please log in with PingOne to use this tool.",
+        }),
+      ],
+    };
+  }
+
   const mcpClient = createMcpClient(state.userToken);
   try {
     const mcpTools = await mcpClient.getTools();
