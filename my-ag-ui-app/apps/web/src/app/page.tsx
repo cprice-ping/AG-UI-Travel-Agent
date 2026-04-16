@@ -2,7 +2,7 @@
 
 import { useCoAgent, useCopilotAction } from "@copilotkit/react-core";
 import { CopilotKitCSSProperties, CopilotSidebar } from "@copilotkit/react-ui";
-import { useSession, signIn, signOut } from "next-auth/react";
+import { useSession, signOut } from "next-auth/react";
 import { useEffect } from "react";
 
 // ─── Types (mirror agent state) ──────────────────────────────────────────────
@@ -103,8 +103,34 @@ export default function TravelAgentPage() {
 // ─── Main Content ─────────────────────────────────────────────────────────────
 
 function TravelContent() {
-  const { data: session, status: authStatus } = useSession();
+  const { data: session, status: authStatus, update: refreshSession } = useSession();
   const accessToken = (session as { accessToken?: string } | null)?.accessToken ?? "";
+
+  /**
+   * Open PingOne login in a centred popup window so the main tab — and all
+   * agent state (destinations, itinerary, chat history) — is preserved.
+   * When the popup closes, refresh the Auth.js session in the background.
+   */
+  function handleLogin() {
+    const width = 520;
+    const height = 640;
+    const left = Math.round(window.screenX + (window.outerWidth - width) / 2);
+    const top = Math.round(window.screenY + (window.outerHeight - height) / 2);
+
+    const popup = window.open(
+      "/api/auth/signin/pingone",
+      "pingone-login",
+      `width=${width},height=${height},left=${left},top=${top},popup=1,noreferrer`,
+    );
+
+    // Poll until the popup closes, then pull the new session cookie.
+    const timer = setInterval(() => {
+      if (popup?.closed) {
+        clearInterval(timer);
+        refreshSession(); // re-fetches the Auth.js session without a page reload
+      }
+    }, 500);
+  }
 
   const { state, setState } = useCoAgent<AgentState>({
     name: "starterAgent",
@@ -358,7 +384,7 @@ function TravelContent() {
               </div>
             ) : (
               <button
-                onClick={() => signIn("pingone")}
+                onClick={handleLogin}
                 className="flex items-center gap-2 bg-sky-500 hover:bg-sky-400 text-white text-sm font-medium px-4 py-2 rounded-full transition-all shadow-lg shadow-sky-500/30"
               >
                 <span>🔐</span> Login with PingOne
