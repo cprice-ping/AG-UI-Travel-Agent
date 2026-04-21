@@ -1,215 +1,187 @@
 # AG-UI Travel Agent
 
-An AI travel planning assistant built on [AG-UI](https://docs.ag-ui.com) / [CopilotKit](https://copilotkit.ai) + [LangGraph](https://www.langchain.com/langgraph) + [MCP](https://modelcontextprotocol.io), exploring how user identity and OAuth tokens flow through an agentic architecture.
+An AI travel planning assistant built on [AG-UI](https://docs.ag-ui.com) / [CopilotKit](https://copilotkit.ai) + [LangGraph](https://www.langchain.com/langgraph) + [MCP](https://modelcontextprotocol.io).
 
-The agent calls real MCP servers over HTTP (spec 2025-11-25), authenticated with PingOne-issued Bearer tokens.
+Demonstrates how user identity and OAuth tokens flow securely through an agentic architecture using **RFC 8693 Token Exchange** — the browser never holds tokens that can call MCP tools directly.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Browser                                                     │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  Next.js Web App  (port 3000)                        │   │
-│  │                                                      │   │
-│  │  • CopilotKit sidebar (chat UI)                      │   │
-│  │  • Travel dashboard (destinations, itinerary, cards) │   │
-│  │  • PingOne login popup → Auth.js session             │   │
-│  │  • Passes userTokens: { travel, weather } to agent   │   │
-│  └────────────────────────┬─────────────────────────────┘   │
-└───────────────────────────│─────────────────────────────────┘
-                            │ AG-UI / CopilotKit protocol
-                            ▼
-┌───────────────────────────────────────────────────────────────┐
-│  LangGraph Agent  (port 8123)                                 │
-│                                                               │
-│  • Gemini Pro model (thinkingBudget: 2048)                    │
-│  • Receives userTokens from frontend state                    │
-│  • Connects to each MCP server using its per-server token     │
-│  • Calls frontend actions (addDestination, addItineraryDay…)  │
-│  • Tool schema cache keyed by token map                       │
-└──────────┬────────────────────────────┬───────────────────────┘
-           │ MCP Streamable HTTP         │ MCP Streamable HTTP
-           │ Bearer: <travel token>      │ Bearer: <weather token>
-           │ aud: localhost:3100         │ aud: localhost:3150
-           ▼                            ▼
-┌──────────────────────┐   ┌──────────────────────────────────┐
-│  Travel MCP Server   │   │  Weather MCP Server              │
-│  (port 3100)         │   │  (port 3150)                     │
-│                      │   │                                  │
-│  Tools:              │   │  Tools:                          │
-│  • searchFlights     │   │  • getWeather                    │
-│  • searchHotels      │   │    └─ Open-Meteo geocoding API   │
-│  • getDestinationInfo│   │       + forecast API (free)      │
-│                      │   │  • getCurrentDateTime            │
-│  JWT auth: PingOne   │   │    └─ pure JS, no API call       │
-│  aud: PUBLIC_URL     │   │                                  │
-│                      │   │  JWT auth: PingOne               │
-└──────────┬───────────┘   │  aud: PUBLIC_URL                 │
-           │ X-API-Key     └──────────────────────────────────┘
-           ▼
-┌──────────────────────┐
-│  Travel REST API     │
-│  (port 3200)         │
-│                      │
-│  GET /flights        │
-│  GET /hotels         │
-│  GET /destination    │
-│  GET /weather *      │
-│  GET /health         │
-│                      │
-│  * weather route     │
-│  still present but   │
-│  not used by agent   │
-└──────────────────────┘
+Browser
+│
+│  Next.js Web App  (port 3000)
+│  ├─ CopilotKit sidebar (chat UI)
+│  ├─ Travel dashboard (destinations, itinerary, cards)
+│  ├─ PingOne login popup → Auth.js session
+│  └─ Passes person token (subject_token) to agent via useCoAgent state
+│
+└──[AG-UI / CopilotKit protocol]──▶
+                                    LangGraph Agent  (port 8123)
+                                    ├─ Gemini 2.5 Flash (thinkingBudget: 2048)
+                                    ├─ Holds own client credentials (never in browser)
+                                    ├─ RFC 8693 Token Exchange: person token + CC token → per-server MCP token
+                                    └──[MCP Streamable HTTP, Bearer: <mcp-token>]──▶
+
+                                    ┌─────────────────────┐   ┌────────────────────────┐
+                                    │  Travel MCP Server  │   │  Weather MCP Server    │
+                                    │  (port 3100)        │   │  (port 3150)           │
+                                    │                     │   │                        │
+                                    │  searchFlights      │   │  getWeather            │
+                                    │  searchHotels       │   │    └─ Open-Meteo API   │
+                                    │  getDestinationInfo │   │  getCurrentDateTime    │
+                                    │                     │   │                        │
+                                    │  JWT: PingOne JWKS  │   │  JWT: PingOne JWKS     │
+                                    │  aud: resource URL  │   │  aud: resource URL     │
+                                    └──────────┬──────────┘   └────────────────────────┘
+                                               │ X-API-Key
+                                               ▼
+                                    Travel REST API  (port 3200, internal only)
 ```
 
-### Auth flow
+### Token architecture — RFC 8693 Token Exchange
 
 ```
-User clicks "Login with PingOne"
-         │
-         ▼
-PingOne authorization endpoint
-  scope=openid profile email mcp:travel_tools
-  resource=http://localhost:3100   (travel MCP server audience)
-         │
-         ▼ access token  aud: "http://localhost:3100"
-Auth.js session (Next.js)
-         │
-         ├─── userTokens.travel  ──▶  Travel MCP Server  (aud validated ✓)
-         │
-         └─── userTokens.weather ──▶  Weather MCP Server (aud: localhost:3150 ✗)
-                                       currently uses same token — see note below
-```
+1. User logs in via PingOne popup
+   → Auth.js issues person token
+     aud = Agent Resource URL  (RFC 8707 resource indicator)
+     scope = openid profile email
 
-> **Open issue — multi-server audience**: The MCP spec §9.2 requires the Bearer token `aud` to match each server's identity. With two MCP servers, a correctly-issued token for server A will fail `aud` validation on server B. Options explored in this project:
-> - **RFC 8707 Resource Indicators** — request both audiences at authorization time (correct, requires AS support)
-> - **RFC 8693 Token Exchange** — exchange user token for a server-scoped token (breaks the consent chain)
-> - **Shared audience** — both servers accept the same `MCP_AUDIENCE` value (demo shortcut, weakens isolation)
->
-> For local development, set `MCP_AUDIENCE=http://localhost:3100` in `apps/weather-server/.env` to use the shared-audience approach.
+2. Person token passed to Agent via CopilotKit/AG-UI state
+   (subject_token — proves WHO the user is)
+
+3. Agent holds its own client credentials (server-side only)
+   → Fetches CC token from PingOne (actor_token)
+
+4. Before each MCP call, Agent performs Token Exchange:
+   subject_token  = person token   (WHO — from browser)
+   actor_token    = agent CC token (WHICH component — never leaves agent)
+   audience       = MCP server URL (WHICH server)
+   → MCP token:  aud=<server>, act=<agent-client-id>, sub=<user>
+
+Security: stealing the person token from the browser is not enough to
+call MCP tools — the agent's client secret (held server-side) is also
+required to complete the exchange.
+```
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
-my-ag-ui-app/
 ├── apps/
 │   ├── web/             # Next.js frontend (port 3000)
-│   ├── agent/           # LangGraph agent (port 8123)
+│   ├── agent/           # LangGraph JS agent (port 8123)
 │   ├── mcp-server/      # Travel MCP server — flights, hotels, destinations (port 3100)
 │   ├── weather-server/  # Weather MCP server — weather + datetime tools (port 3150)
-│   └── api/             # Travel REST API — data backend for mcp-server (port 3200)
-├── pnpm-workspace.yaml
-└── turbo.json
+│   └── api/             # Travel REST API — data backend for mcp-server (port 3200, internal)
+├── docker/              # Dockerfiles for all services
+├── docker-compose.yml           # Full stack
+├── docker-compose.gateway.yml   # Overlay: adds PingGateway between Agent and MCP servers
+├── .env.example         # Single config file — copy to .env and fill in
+└── fixtures/            # Test fixtures for e2e smoke tests
 ```
 
 ---
 
 ## Prerequisites
 
-- Node.js 18+
-- pnpm 9.15.0+
-- PingOne tenant (for OIDC login and JWT validation)
-- Gemini API key
+- Docker + Docker Compose
+- PingOne tenant configured (see PingOne setup below)
+- Gemini API key ([aistudio.google.com](https://aistudio.google.com/app/apikey))
 
 ---
 
-## Setup
+## Quick start
 
-### 1. Install dependencies
-
-```bash
-cd my-ag-ui-app
-pnpm install
-```
-
-### 2. Configure each service
-
-**`apps/agent/.env`**
-```env
-GEMINI_API_KEY=...
-MCP_SERVERS={"travel":"http://localhost:3100/mcp","weather":"http://localhost:3150/mcp"}
-```
-
-**`apps/mcp-server/.env`** (copy from `.env.example`)
-```env
-PORT=3100
-PINGONE_ISSUER=https://auth.pingone.com/<ENV_ID>/as
-PINGONE_JWKS_URI=https://auth.pingone.com/<ENV_ID>/as/jwks
-PUBLIC_URL=http://localhost:3100
-ALLOWED_ORIGINS=http://localhost:3000
-API_BASE_URL=http://localhost:3200
-API_KEY=dev-travel-api-key-change-in-production
-```
-
-**`apps/weather-server/.env`** (copy from `.env.example`)
-```env
-PORT=3150
-PINGONE_ISSUER=https://auth.pingone.com/<ENV_ID>/as
-PINGONE_JWKS_URI=https://auth.pingone.com/<ENV_ID>/as/jwks
-PUBLIC_URL=http://localhost:3150
-ALLOWED_ORIGINS=http://localhost:3000
-# For local dev with a single PingOne token — see multi-server auth note above
-MCP_AUDIENCE=http://localhost:3100
-```
-
-**`apps/api/.env`**
-```env
-PORT=3200
-API_KEY=dev-travel-api-key-change-in-production
-```
-
-**`apps/web/.env.local`**
-```env
-AUTH_SECRET=...
-AUTH_PINGONE_ID=...            # PingOne application client ID
-AUTH_PINGONE_SECRET=...        # PingOne application client secret
-AUTH_PINGONE_ISSUER=https://auth.pingone.com/<ENV_ID>/as
-NEXT_PUBLIC_COPILOTKIT_URL=http://localhost:8123
-```
-
-### 3. Start all services
-
-Each service needs its own terminal:
+### 1. Configure
 
 ```bash
-# Terminal 1 — Travel REST API
-cd apps/api && pnpm dev
-
-# Terminal 2 — Travel MCP Server
-cd apps/mcp-server && pnpm dev
-
-# Terminal 3 — Weather MCP Server
-cd apps/weather-server && pnpm dev
-
-# Terminal 4 — LangGraph Agent
-cd apps/agent && npx @langchain/langgraph-cli@latest dev --port 8123 --no-browser
-
-# Terminal 5 — Next.js Web App
-cd apps/web && pnpm dev
+cp .env.example .env
 ```
 
-Then open http://localhost:3000, log in with PingOne, and start chatting.
+Edit `.env` — the file is split into sections:
+
+| Section | What to fill in |
+|---|---|
+| `OIDC_*` | PingOne environment ID → issuer/JWKS/token endpoint URLs |
+| `AUTH_CLIENT_ID/SECRET` | PingOne app with Authorization Code + PKCE grant |
+| `AUTH_SECRET` | Random string: `openssl rand -base64 32` |
+| `AGENT_CLIENT_ID/SECRET` | PingOne app with Client Credentials + Token Exchange grants |
+| `GEMINI_API_KEY` | Google AI Studio key |
+| `TRAVEL/WEATHER_SERVER_AUDIENCE` | Must match Resource URL registered in PingOne |
+
+### 2. Start
+
+```bash
+docker compose up --build
+```
+
+Open http://localhost:3000, click **Login with PingOne**, then start chatting.
+
+### 3. With PingGateway (optional)
+
+Inserts PingGateway between the Agent and MCP servers. You provide the gateway route config.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gateway.yml up --build
+```
+
+The overlay overrides `MCP_SERVERS` on the agent to route through `http://pinggateway:8080/travel/mcp` and `/weather/mcp`. Set `PINGGATEWAY_CONFIG_DIR` in `.env` to point at your config directory.
 
 ---
 
-## MCP Server compliance
+## PingOne setup
 
-Both MCP servers implement spec 2025-11-25:
+You need three things in your PingOne environment:
+
+### 1. Web application (Authorization Code + PKCE)
+
+- Grant type: Authorization Code + PKCE
+- Redirect URI: `http://localhost:3000/api/auth/callback/pingone`
+- → `AUTH_CLIENT_ID` / `AUTH_CLIENT_SECRET` in `.env`
+
+### 2. Agent application (Client Credentials + Token Exchange)
+
+- Grant types: Client Credentials, Token Exchange
+- → `AGENT_CLIENT_ID` / `AGENT_CLIENT_SECRET` in `.env`
+
+### 3. Two PingOne Resources (one per MCP server)
+
+Each Resource represents an MCP server's audience:
+
+| Resource | Audience URL | Scope |
+|---|---|---|
+| Travel MCP | `http://localhost:3100` | `mcp:travel_tools` |
+| Weather MCP | `http://localhost:3150` | `mcp:weather_tools` |
+
+- Assign both scopes to the Agent application
+- Set `TRAVEL_SERVER_AUDIENCE` / `WEATHER_SERVER_AUDIENCE` in `.env` to match the audience URLs exactly
+
+### 4. Agent Resource (RFC 8707)
+
+Register a Resource for the Agent itself:
+
+| Resource | Audience URL |
+|---|---|
+| Agent | `http://localhost:8123` |
+
+The web application's token will have `aud=http://localhost:8123` — this scopes the person token to the Agent so it can only be used for Token Exchange, not to call MCP servers directly.
+
+---
+
+## MCP server compliance
+
+Both MCP servers implement the MCP Streamable HTTP spec (2025-11-25):
 
 | Requirement | Implementation |
 |---|---|
 | §2.0.1 Origin validation | 403 for unlisted browser origins |
-| §2.7 MCP-Protocol-Version | 400 for unsupported versions on established sessions |
+| §2.7 MCP-Protocol-Version | 400 for unsupported versions |
 | §4.1 Protected Resource Metadata | `GET /.well-known/oauth-protected-resource` |
 | §4.2 WWW-Authenticate | `Bearer resource_metadata=...` on all 401s |
-| §9.2 Bearer token validation | PingOne JWKS + issuer + audience |
+| §9.2 Bearer token validation | PingOne JWKS + issuer + audience check |
 
 ---
 
@@ -217,10 +189,12 @@ Both MCP servers implement spec 2025-11-25:
 
 | Layer | Technology |
 |---|---|
-| Frontend | Next.js 15, Tailwind CSS, CopilotKit |
+| Frontend | Next.js 16, Tailwind CSS, CopilotKit |
 | Auth | Auth.js v5 (beta), PingOne OIDC |
-| Agent | LangGraph, `@langchain/google-genai` (Gemini) |
+| Token security | RFC 8693 Token Exchange, RFC 8707 Resource Indicators |
+| Agent | LangGraph JS, `@langchain/google-genai` (Gemini 2.5 Flash) |
 | MCP transport | `@modelcontextprotocol/sdk` Streamable HTTP |
-| JWT validation | `jose` |
+| JWT validation | `jose` (JWKS, issuer, audience) |
 | Weather data | Open-Meteo (free, no API key) |
 | Monorepo | Turborepo + pnpm workspaces |
+| Deployment | Docker Compose (with optional PingGateway overlay) |
