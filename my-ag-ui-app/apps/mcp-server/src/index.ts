@@ -1,26 +1,17 @@
 /**
  * Travel MCP Server
  *
- * Implements the MCP Streamable HTTP transport (spec 2025-11-25).
- * Every request is authenticated via a PingOne-issued JWT Bearer token validated
- * against PingOne's JWKS endpoint.
+ * Exposes three tools: searchFlights, searchHotels, getDestinationInfo.
+ * Weather and date/time tools live in the separate weather-server package.
+ *
+ * Implements MCP Streamable HTTP transport (spec 2025-11-25) with PingOne JWT auth.
  *
  * Endpoints:
- *   POST   /mcp                               — initiate session / send requests
- *   GET    /mcp                               — SSE stream for server-to-client notifications
- *   DELETE /mcp                               — terminate session
- *   GET    /health                             — liveness check
+ *   POST   /mcp                                  — initiate session / send requests
+ *   GET    /mcp                                  — SSE stream for server notifications
+ *   DELETE /mcp                                  — terminate session
+ *   GET    /health                               — liveness check
  *   GET    /.well-known/oauth-protected-resource — RFC 9728 resource metadata (§4.1)
- *
- * 2025-11-25 compliance notes:
- *   §2.0.1 — Origin header validated; returns 403 for unknown browser origins.
- *   §2.7   — MCP-Protocol-Version header validated on established sessions.
- *   §4.2   — WWW-Authenticate includes resource_metadata URL on 401.
- *   §9.2   — Bearer token validated on every request (not session-based auth).
- *   Known limitation: token audience (aud) claim is not validated — the access
- *   token is issued by PingOne to the web-app OAuth client, not directly to this
- *   resource server.  Fixing this requires registering the MCP server as a
- *   separate PingOne resource and having Auth.js request audience-bound tokens.
  */
 
 import "dotenv/config";
@@ -243,23 +234,6 @@ function registerTravelTools(server: McpServer, claims: TokenClaims) {
       return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
     },
   );
-
-  // ── getWeather ─────────────────────────────────────────────────────────────
-  server.registerTool(
-    "getWeather",
-    {
-      title: "Get Weather",
-      description: "Get the current weather forecast for a travel destination.",
-      inputSchema: z.object({
-        location: z.string().describe("City or location to get weather for"),
-      }),
-    },
-    async ({ location }) => {
-      logToolCall("getWeather", { location });
-      const data = await apiGet("/weather", { location }) as { summary: string };
-      return { content: [{ type: "text" as const, text: data.summary ?? JSON.stringify(data) }] };
-    },
-  );
 }
 
 // ─── Express app ──────────────────────────────────────────────────────────────
@@ -309,6 +283,7 @@ app.get("/.well-known/oauth-protected-resource", (_req, res) => {
     resource: `${PUBLIC_URL}/mcp`,
     authorization_servers: PINGONE_ISSUER ? [PINGONE_ISSUER] : [],
     scopes_supported: ["openid", "profile", "email", "mcp:travel_tools"],
+    // weather tools are on the weather-server (port 3150)
     bearer_methods_supported: ["header"],
   });
 });

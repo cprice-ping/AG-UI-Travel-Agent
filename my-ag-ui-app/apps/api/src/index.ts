@@ -191,19 +191,88 @@ function getDestinationInfo(name: string) {
       };
 }
 
-function getWeather(location: string) {
-  const conditions = ["Sunny ☀️", "Partly cloudy ⛅", "Warm and clear 🌤️", "Mild with light breeze 🌬️"];
-  const condition = conditions[Math.floor(Math.random() * conditions.length)];
-  const tempC = Math.floor(Math.random() * 15) + 18;
+// WMO weather interpretation codes → human-readable condition + emoji
+// https://open-meteo.com/en/docs#weathervariables
+const WMO_CONDITIONS: Record<number, { label: string; emoji: string }> = {
+  0:  { label: "Clear sky",             emoji: "☀️"  },
+  1:  { label: "Mainly clear",          emoji: "🌤️" },
+  2:  { label: "Partly cloudy",         emoji: "⛅"  },
+  3:  { label: "Overcast",              emoji: "☁️"  },
+  45: { label: "Foggy",                 emoji: "🌫️" },
+  48: { label: "Icy fog",               emoji: "🌫️" },
+  51: { label: "Light drizzle",         emoji: "🌦️" },
+  53: { label: "Drizzle",               emoji: "🌦️" },
+  55: { label: "Heavy drizzle",         emoji: "🌧️" },
+  61: { label: "Light rain",            emoji: "🌧️" },
+  63: { label: "Rain",                  emoji: "🌧️" },
+  65: { label: "Heavy rain",            emoji: "🌧️" },
+  71: { label: "Light snow",            emoji: "🌨️" },
+  73: { label: "Snow",                  emoji: "❄️"  },
+  75: { label: "Heavy snow",            emoji: "❄️"  },
+  77: { label: "Snow grains",           emoji: "🌨️" },
+  80: { label: "Light showers",         emoji: "🌦️" },
+  81: { label: "Showers",               emoji: "🌧️" },
+  82: { label: "Heavy showers",         emoji: "🌧️" },
+  85: { label: "Snow showers",          emoji: "🌨️" },
+  86: { label: "Heavy snow showers",    emoji: "❄️"  },
+  95: { label: "Thunderstorm",          emoji: "⛈️"  },
+  96: { label: "Thunderstorm with hail",emoji: "⛈️"  },
+  99: { label: "Thunderstorm with hail",emoji: "⛈️"  },
+};
+
+async function getWeather(location: string) {
+  // 1. Geocode city name → lat/lon using Open-Meteo's free geocoding API
+  const geoRes = await fetch(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en&format=json`,
+  );
+  if (!geoRes.ok) throw new Error(`Geocoding failed: ${geoRes.status}`);
+  const geoData = await geoRes.json() as {
+    results?: { latitude: number; longitude: number; name: string; country: string; timezone: string }[];
+  };
+
+  if (!geoData.results?.length) {
+    throw new Error(`Location not found: ${location}`);
+  }
+  const { latitude, longitude, name, country, timezone } = geoData.results[0];
+
+  // 2. Fetch current weather from Open-Meteo (free, no API key)
+  const wxRes = await fetch(
+    `https://api.open-meteo.com/v1/forecast` +
+    `?latitude=${latitude}&longitude=${longitude}` +
+    `&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m` +
+    `&temperature_unit=celsius&wind_speed_unit=kmh&timezone=${encodeURIComponent(timezone)}`,
+  );
+  if (!wxRes.ok) throw new Error(`Weather fetch failed: ${wxRes.status}`);
+  const wxData = await wxRes.json() as {
+    current: {
+      temperature_2m: number;
+      apparent_temperature: number;
+      relative_humidity_2m: number;
+      weather_code: number;
+      wind_speed_10m: number;
+      time: string;
+    };
+  };
+
+  const cur = wxData.current;
+  const wmo = WMO_CONDITIONS[cur.weather_code] ?? { label: "Unknown", emoji: "🌡️" };
+  const tempC = Math.round(cur.temperature_2m);
   const tempF = Math.round(tempC * 9 / 5 + 32);
-  const humidity = Math.floor(Math.random() * 30) + 40;
+  const feelsC = Math.round(cur.apparent_temperature);
+  const feelsF = Math.round(feelsC * 9 / 5 + 32);
+
   return {
-    location,
-    condition,
+    location: `${name}, ${country}`,
+    condition: `${wmo.emoji} ${wmo.label}`,
     temperatureC: tempC,
     temperatureF: tempF,
-    humidity,
-    summary: `Weather in ${location}: ${condition}, ${tempC}°C (${tempF}°F). Humidity: ${humidity}%. Perfect for exploring!`,
+    feelsLikeC: feelsC,
+    feelsLikeF: feelsF,
+    humidity: cur.relative_humidity_2m,
+    windSpeedKmh: Math.round(cur.wind_speed_10m),
+    observedAt: cur.time,
+    source: "Open-Meteo (open-meteo.com)",
+    summary: `${wmo.emoji} ${name}: ${wmo.label}, ${tempC}°C (${tempF}°F), feels like ${feelsC}°C. Humidity ${cur.relative_humidity_2m}%, wind ${Math.round(cur.wind_speed_10m)} km/h.`,
   };
 }
 
@@ -252,14 +321,20 @@ app.get("/destination", requireApiKey, (req: Request, res: Response) => {
   res.json(getDestinationInfo(String(name)));
 });
 
-app.get("/weather", requireApiKey, (req: Request, res: Response) => {
+app.get("/weather", requireApiKey, async (req: Request, res: Response) => {
   const { location } = req.query;
   if (!location) {
     res.status(400).json({ error: "location is required" });
     return;
   }
   console.log(`[api] GET /weather | location=${location}`);
-  res.json(getWeather(String(location)));
+  try {
+    res.json(await getWeather(String(location)));
+  } catch (err) {
+    const msg = (err as Error).message;
+    const status = msg.includes("not found") ? 404 : 502;
+    res.status(status).json({ error: msg });
+  }
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────

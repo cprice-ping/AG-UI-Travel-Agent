@@ -4,6 +4,7 @@ import { useCoAgent, useCopilotAction } from "@copilotkit/react-core";
 import { CopilotKitCSSProperties, CopilotSidebar } from "@copilotkit/react-ui";
 import { useSession, signOut } from "next-auth/react";
 import { useEffect } from "react";
+import { useRouter } from "next/navigation";
 
 // ─── Types (mirror agent state) ──────────────────────────────────────────────
 
@@ -104,7 +105,12 @@ export default function TravelAgentPage() {
 
 function TravelContent() {
   const { data: session, status: authStatus, update: refreshSession } = useSession();
+  // Person token — aud = Agent (RFC 8707). RFC 8693 subject_token.
+  // The Agent combines this with its own client_credentials token to perform
+  // Token Exchange, yielding per-MCP-server tokens. The browser never sees
+  // or produces MCP-scoped tokens directly.
   const accessToken = (session as { accessToken?: string } | null)?.accessToken ?? "";
+  const router = useRouter();
 
   /**
    * Open PingOne login in a centred popup window so the main tab — and all
@@ -113,10 +119,13 @@ function TravelContent() {
    * which posts a message back here and calls window.close().
    */
   useEffect(() => {
-    function onMessage(event: MessageEvent) {
+    async function onMessage(event: MessageEvent) {
       if (event.origin !== window.location.origin) return;
       if (event.data === "auth:complete") {
-        refreshSession(); // re-fetches the Auth.js session without a page reload
+        // router.refresh() busts the Next.js route cache so the subsequent
+        // update() call gets a fresh (authenticated) session from the server.
+        router.refresh();
+        await refreshSession();
       }
     }
     window.addEventListener("message", onMessage);
@@ -151,17 +160,19 @@ function TravelContent() {
       travelDates: { start: "", end: "" },
       flightResults: [],
       hotelResults: [],
-      userTokens: { travel: accessToken },
+      // _subject = person token passed to Agent as RFC 8693 subject_token.
+      // Agent performs Token Exchange server-side to get per-MCP-server tokens.
+      userTokens: { _subject: accessToken },
     },
   });
 
-  // Sync the travel server token into agent state whenever the session changes.
+  // Sync person token into agent state whenever the session changes.
   // Must be in useEffect — calling setState in the render body is a React
   // anti-pattern that can cause loops or silently drop the update.
   useEffect(() => {
     setState((prev) => ({
       ...prev,
-      userTokens: { ...prev.userTokens, travel: accessToken },
+      userTokens: { _subject: accessToken },
     } as AgentState));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accessToken]);
@@ -313,7 +324,7 @@ function TravelContent() {
     render: ({ args, result, status }) => (
       <WeatherCard
         location={args.location}
-        forecast={result || ""}
+        result={(result as string | WeatherData) || ""}
         isLoading={status === "inProgress"}
       />
     ),
@@ -658,26 +669,77 @@ function HotelSearchCard({
   );
 }
 
+type WeatherData = {
+  condition?: string;
+  temperatureC?: number;
+  temperatureF?: number;
+  feelsLikeC?: number;
+  feelsLikeF?: number;
+  humidity?: number;
+  windSpeedKmh?: number;
+  summary?: string;
+};
+
 function WeatherCard({
   location,
-  forecast,
+  result,
   isLoading,
 }: {
   location?: string;
-  forecast: string;
+  result: string | WeatherData;
   isLoading: boolean;
 }) {
+  // CopilotKit may pass the result as an already-parsed object or as a JSON string.
+  const data: WeatherData = typeof result === "object" && result !== null
+    ? result
+    : safeParseJSON<WeatherData>(result as string, {});
+
+  const conditionEmoji = (() => {
+    const c = (data.condition ?? "").toLowerCase();
+    if (c.includes("sun") || c.includes("clear")) return "☀️";
+    if (c.includes("cloud") && c.includes("part")) return "⛅";
+    if (c.includes("cloud")) return "☁️";
+    if (c.includes("rain") || c.includes("shower")) return "🌧️";
+    if (c.includes("storm") || c.includes("thunder")) return "⛈️";
+    if (c.includes("snow")) return "❄️";
+    if (c.includes("fog") || c.includes("mist")) return "🌫️";
+    if (c.includes("wind") || c.includes("breez")) return "🌬️";
+    return "🌤️";
+  })();
+
   return (
     <div className="bg-gradient-to-r from-sky-500 to-teal-500 rounded-xl overflow-hidden shadow-xl my-2 max-w-sm">
       <div className="px-4 py-3 bg-black/20 flex items-center gap-2">
-        <span className="text-xl">🌤️</span>
+        <span className="text-xl">{conditionEmoji}</span>
         <p className="text-white font-semibold text-sm">{location}</p>
       </div>
-      <div className="px-4 py-3">
+      <div className="px-4 py-4">
         {isLoading ? (
           <p className="text-white/70 text-sm">Fetching forecast…</p>
+        ) : data.temperatureC !== undefined ? (
+          <div className="space-y-3">
+            <div className="flex items-end gap-3">
+              <span className="text-white text-4xl font-bold leading-none">{data.temperatureC}°C</span>
+              <span className="text-white/60 text-sm mb-1">{data.temperatureF}°F</span>
+            </div>
+            <p className="text-white/90 text-sm font-medium">{data.condition}</p>
+            {data.humidity !== undefined && (
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs text-white/70">
+                  <span>Humidity</span>
+                  <span>{data.humidity}%</span>
+                </div>
+                <div className="h-1.5 bg-white/20 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-white/60 rounded-full"
+                    style={{ width: `${data.humidity}%` }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
         ) : (
-          <p className="text-white text-sm">{forecast}</p>
+          <p className="text-white text-sm">{data.summary ?? (typeof result === "string" ? result : "")}</p>
         )}
       </div>
     </div>

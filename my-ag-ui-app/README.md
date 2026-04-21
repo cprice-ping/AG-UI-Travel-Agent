@@ -1,106 +1,226 @@
-# CopilotKit <> LangGraph Starter
+# AG-UI Travel Agent
 
-This is a starter template for building AI agents using [LangGraph](https://www.langchain.com/langgraph) and [CopilotKit](https://copilotkit.ai). It provides a modern Next.js application with an integrated LangGraph agent to be built on top of.
+An AI travel planning assistant built on [AG-UI](https://docs.ag-ui.com) / [CopilotKit](https://copilotkit.ai) + [LangGraph](https://www.langchain.com/langgraph) + [MCP](https://modelcontextprotocol.io), exploring how user identity and OAuth tokens flow through an agentic architecture.
 
-This project is organized as a monorepo using [Turborepo](https://turbo.build) and [pnpm workspaces](https://pnpm.io/workspaces).
+The agent calls real MCP servers over HTTP (spec 2025-11-25), authenticated with PingOne-issued Bearer tokens.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Browser                                                     │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Next.js Web App  (port 3000)                        │   │
+│  │                                                      │   │
+│  │  • CopilotKit sidebar (chat UI)                      │   │
+│  │  • Travel dashboard (destinations, itinerary, cards) │   │
+│  │  • PingOne login popup → Auth.js session             │   │
+│  │  • Passes userTokens: { travel, weather } to agent   │   │
+│  └────────────────────────┬─────────────────────────────┘   │
+└───────────────────────────│─────────────────────────────────┘
+                            │ AG-UI / CopilotKit protocol
+                            ▼
+┌───────────────────────────────────────────────────────────────┐
+│  LangGraph Agent  (port 8123)                                 │
+│                                                               │
+│  • Gemini Pro model (thinkingBudget: 2048)                    │
+│  • Receives userTokens from frontend state                    │
+│  • Connects to each MCP server using its per-server token     │
+│  • Calls frontend actions (addDestination, addItineraryDay…)  │
+│  • Tool schema cache keyed by token map                       │
+└──────────┬────────────────────────────┬───────────────────────┘
+           │ MCP Streamable HTTP         │ MCP Streamable HTTP
+           │ Bearer: <travel token>      │ Bearer: <weather token>
+           │ aud: localhost:3100         │ aud: localhost:3150
+           ▼                            ▼
+┌──────────────────────┐   ┌──────────────────────────────────┐
+│  Travel MCP Server   │   │  Weather MCP Server              │
+│  (port 3100)         │   │  (port 3150)                     │
+│                      │   │                                  │
+│  Tools:              │   │  Tools:                          │
+│  • searchFlights     │   │  • getWeather                    │
+│  • searchHotels      │   │    └─ Open-Meteo geocoding API   │
+│  • getDestinationInfo│   │       + forecast API (free)      │
+│                      │   │  • getCurrentDateTime            │
+│  JWT auth: PingOne   │   │    └─ pure JS, no API call       │
+│  aud: PUBLIC_URL     │   │                                  │
+│                      │   │  JWT auth: PingOne               │
+└──────────┬───────────┘   │  aud: PUBLIC_URL                 │
+           │ X-API-Key     └──────────────────────────────────┘
+           ▼
+┌──────────────────────┐
+│  Travel REST API     │
+│  (port 3200)         │
+│                      │
+│  GET /flights        │
+│  GET /hotels         │
+│  GET /destination    │
+│  GET /weather *      │
+│  GET /health         │
+│                      │
+│  * weather route     │
+│  still present but   │
+│  not used by agent   │
+└──────────────────────┘
+```
+
+### Auth flow
+
+```
+User clicks "Login with PingOne"
+         │
+         ▼
+PingOne authorization endpoint
+  scope=openid profile email mcp:travel_tools
+  resource=http://localhost:3100   (travel MCP server audience)
+         │
+         ▼ access token  aud: "http://localhost:3100"
+Auth.js session (Next.js)
+         │
+         ├─── userTokens.travel  ──▶  Travel MCP Server  (aud validated ✓)
+         │
+         └─── userTokens.weather ──▶  Weather MCP Server (aud: localhost:3150 ✗)
+                                       currently uses same token — see note below
+```
+
+> **Open issue — multi-server audience**: The MCP spec §9.2 requires the Bearer token `aud` to match each server's identity. With two MCP servers, a correctly-issued token for server A will fail `aud` validation on server B. Options explored in this project:
+> - **RFC 8707 Resource Indicators** — request both audiences at authorization time (correct, requires AS support)
+> - **RFC 8693 Token Exchange** — exchange user token for a server-scoped token (breaks the consent chain)
+> - **Shared audience** — both servers accept the same `MCP_AUDIENCE` value (demo shortcut, weakens isolation)
+>
+> For local development, set `MCP_AUDIENCE=http://localhost:3100` in `apps/weather-server/.env` to use the shared-audience approach.
+
+---
 
 ## Project Structure
 
 ```
-.
+my-ag-ui-app/
 ├── apps/
-│   ├── web/          # Next.js frontend application
-│   └── agent/        # LangGraph agent
+│   ├── web/             # Next.js frontend (port 3000)
+│   ├── agent/           # LangGraph agent (port 8123)
+│   ├── mcp-server/      # Travel MCP server — flights, hotels, destinations (port 3100)
+│   ├── weather-server/  # Weather MCP server — weather + datetime tools (port 3150)
+│   └── api/             # Travel REST API — data backend for mcp-server (port 3200)
 ├── pnpm-workspace.yaml
-├── turbo.json
-└── package.json
+└── turbo.json
 ```
+
+---
 
 ## Prerequisites
 
 - Node.js 18+
-- [pnpm](https://pnpm.io/installation) 9.15.0 or later
-- OpenAI API Key (for the LangGraph agent)
+- pnpm 9.15.0+
+- PingOne tenant (for OIDC login and JWT validation)
+- Gemini API key
 
-## Getting Started
+---
 
-1. Install all dependencies (this installs everything for both apps):
+## Setup
+
+### 1. Install dependencies
 
 ```bash
+cd my-ag-ui-app
 pnpm install
 ```
 
-2. Set up your OpenAI API key:
+### 2. Configure each service
 
-```bash
-cd apps/agent
-echo "OPENAI_API_KEY=your-openai-api-key-here" > .env
+**`apps/agent/.env`**
+```env
+GEMINI_API_KEY=...
+MCP_SERVERS={"travel":"http://localhost:3100/mcp","weather":"http://localhost:3150/mcp"}
 ```
 
-3. Start the development servers:
-
-```bash
-pnpm dev
+**`apps/mcp-server/.env`** (copy from `.env.example`)
+```env
+PORT=3100
+PINGONE_ISSUER=https://auth.pingone.com/<ENV_ID>/as
+PINGONE_JWKS_URI=https://auth.pingone.com/<ENV_ID>/as/jwks
+PUBLIC_URL=http://localhost:3100
+ALLOWED_ORIGINS=http://localhost:3000
+API_BASE_URL=http://localhost:3200
+API_KEY=dev-travel-api-key-change-in-production
 ```
 
-This will start both the Next.js app (on port 3000) and the LangGraph agent (on port 8123) using Turborepo.
-
-## Available Scripts
-
-All scripts use Turborepo to run tasks across the monorepo:
-
-- `pnpm dev` - Starts both the web app and agent servers in development mode
-- `pnpm dev:studio` - Starts the web app and agent with LangGraph Studio UI
-- `pnpm build` - Builds all apps for production
-- `pnpm lint` - Runs linting across all apps
-
-### Running Scripts for Individual Apps
-
-You can also run scripts for individual apps using pnpm's filter flag:
-
-```bash
-# Run dev for just the web app
-pnpm --filter web dev
-
-# Run dev for just the agent
-pnpm --filter agent dev
-
-# Or navigate to the app directory
-cd apps/web
-pnpm dev
+**`apps/weather-server/.env`** (copy from `.env.example`)
+```env
+PORT=3150
+PINGONE_ISSUER=https://auth.pingone.com/<ENV_ID>/as
+PINGONE_JWKS_URI=https://auth.pingone.com/<ENV_ID>/as/jwks
+PUBLIC_URL=http://localhost:3150
+ALLOWED_ORIGINS=http://localhost:3000
+# For local dev with a single PingOne token — see multi-server auth note above
+MCP_AUDIENCE=http://localhost:3100
 ```
 
-## Customization
+**`apps/api/.env`**
+```env
+PORT=3200
+API_KEY=dev-travel-api-key-change-in-production
+```
 
-The main UI component is in `apps/web/src/app/page.tsx`. You can:
+**`apps/web/.env.local`**
+```env
+AUTH_SECRET=...
+AUTH_PINGONE_ID=...            # PingOne application client ID
+AUTH_PINGONE_SECRET=...        # PingOne application client secret
+AUTH_PINGONE_ISSUER=https://auth.pingone.com/<ENV_ID>/as
+NEXT_PUBLIC_COPILOTKIT_URL=http://localhost:8123
+```
 
-- Modify the theme colors and styling
-- Add new frontend actions
-- Utilize shared-state
-- Customize your user-interface for interacting with LangGraph
+### 3. Start all services
 
-The LangGraph agent code is in `apps/agent/src/`.
+Each service needs its own terminal:
 
-## 📚 Documentation
+```bash
+# Terminal 1 — Travel REST API
+cd apps/api && pnpm dev
 
-- [CopilotKit Documentation](https://docs.copilotkit.ai) - Explore CopilotKit's capabilities
-- [LangGraph Documentation](https://langchain-ai.github.io/langgraph/) - Learn more about LangGraph and its features
-- [Next.js Documentation](https://nextjs.org/docs) - Learn about Next.js features and API
+# Terminal 2 — Travel MCP Server
+cd apps/mcp-server && pnpm dev
 
-## Contributing
+# Terminal 3 — Weather MCP Server
+cd apps/weather-server && pnpm dev
 
-Feel free to submit issues and enhancement requests! This starter is designed to be easily extensible.
+# Terminal 4 — LangGraph Agent
+cd apps/agent && npx @langchain/langgraph-cli@latest dev --port 8123 --no-browser
 
-## License
+# Terminal 5 — Next.js Web App
+cd apps/web && pnpm dev
+```
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Then open http://localhost:3000, log in with PingOne, and start chatting.
 
-## Troubleshooting
+---
 
-### Agent Connection Issues
+## MCP Server compliance
 
-If you see "I'm having trouble connecting to my tools", make sure:
+Both MCP servers implement spec 2025-11-25:
 
-1. The LangGraph agent is running on port 8000
-2. Your OpenAI API key is set correctly
-3. Both servers started successfully
+| Requirement | Implementation |
+|---|---|
+| §2.0.1 Origin validation | 403 for unlisted browser origins |
+| §2.7 MCP-Protocol-Version | 400 for unsupported versions on established sessions |
+| §4.1 Protected Resource Metadata | `GET /.well-known/oauth-protected-resource` |
+| §4.2 WWW-Authenticate | `Bearer resource_metadata=...` on all 401s |
+| §9.2 Bearer token validation | PingOne JWKS + issuer + audience |
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | Next.js 15, Tailwind CSS, CopilotKit |
+| Auth | Auth.js v5 (beta), PingOne OIDC |
+| Agent | LangGraph, `@langchain/google-genai` (Gemini) |
+| MCP transport | `@modelcontextprotocol/sdk` Streamable HTTP |
+| JWT validation | `jose` |
+| Weather data | Open-Meteo (free, no API key) |
+| Monorepo | Turborepo + pnpm workspaces |
