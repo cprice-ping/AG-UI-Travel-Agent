@@ -1,0 +1,68 @@
+# PingGateway overlay for docker-compose
+#
+# Adds PingGateway between the Agent and the MCP servers.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gateway.yml up --build
+#
+# What this overlay does:
+#   1. Adds a `pinggateway` service running PingGateway on port 9000.
+#   2. PingGateway routes:
+#        /travel/* → http://mcp-travel:3100   (strips /travel prefix)
+#        /weather/* → http://mcp-weather:3150 (strips /weather prefix)
+#   3. Overrides the `agent` service's MCP_SERVERS env var to route
+#      through PingGateway instead of directly to the MCP containers.
+#   4. Makes `agent` depend on `pinggateway` being healthy first.
+#
+# PingGateway image:
+#   Community / evaluation: pingidentity/openig:latest
+#   Production / licensed:  registry.pingidentity.com/pinggateway/pinggateway:<version>
+#   Set PINGGATEWAY_IMAGE in .env if you need a specific tag (default: pingidentity/openig:latest).
+#
+# To enable JWT enforcement at the gateway layer (centralised policy):
+#   Edit docker/pinggateway/config/routes/*.json and uncomment the
+#   OAuth2ResourceServerFilter section in each route.
+
+services:
+
+  # ── PingGateway ────────────────────────────────────────────────────────────
+  pinggateway:
+    image: ${PINGGATEWAY_IMAGE:-pingidentity/openig:latest}
+    ports:
+      - "${GATEWAY_PORT:-9000}:8080"
+    volumes:
+      # Mount the route config read-only so edits take effect on restart.
+      - ./docker/pinggateway/config:/var/openig/config:ro
+    environment:
+      # Expose OIDC AS config so routes can reference it in JWT enforcement.
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_JWKS_URI: ${OIDC_JWKS_URI}
+    depends_on:
+      mcp-travel:
+        condition: service_healthy
+      mcp-weather:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://localhost:8080/
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Agent — override MCP_SERVERS to route through PingGateway ─────────────
+  agent:
+    environment:
+      # PingGateway listens on :8080 inside the Docker network.
+      # Path prefixes (/travel, /weather) are stripped by the gateway routes
+      # before forwarding to the upstream MCP servers.
+      MCP_SERVERS: >-
+        {"travel":"http://pinggateway:8080/travel/mcp","weather":"http://pinggateway:8080/weather/mcp"}
+    depends_on:
+      pinggateway:
+        condition: service_healthy

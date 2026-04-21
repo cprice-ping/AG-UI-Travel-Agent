@@ -1,0 +1,184 @@
+# AG-UI Travel Agent — demo docker-compose
+#
+# QUICK START
+# ───────────
+# 1. Copy .env.example → .env and fill in your credentials
+# 2. docker compose up --build
+# 3. Open http://localhost:3000
+#
+# PINGGATEWAY OVERLAY (optional)
+# ──────────────────────────────
+# Adds PingGateway between the Agent and the MCP servers.
+# Run instead:  docker compose -f docker-compose.yml -f docker-compose.gateway.yml up --build
+#
+# All shared OAuth AS config is defined once via OIDC_* variables in the
+# root .env and mapped into each service's expected env var names below.
+
+services:
+
+  # ── Next.js web frontend ──────────────────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      # Auth.js / NextAuth
+      AUTH_SECRET: ${AUTH_SECRET}
+      AUTH_PINGONE_CLIENT_ID: ${AUTH_CLIENT_ID}
+      AUTH_PINGONE_CLIENT_SECRET: ${AUTH_CLIENT_SECRET}
+      AUTH_PINGONE_ISSUER: ${OIDC_ISSUER}
+      AUTH_URL: ${AUTH_URL:-http://localhost:3000}
+      NEXTAUTH_URL: ${AUTH_URL:-http://localhost:3000}
+      # RFC 8707: person token aud = Agent URL.
+      # Must match what you registered as the Agent Resource in PingOne.
+      AUTH_AGENT_RESOURCE: ${AGENT_RESOURCE_URL:-http://localhost:8123}
+      # Agent endpoint (Docker-internal)
+      LANGGRAPH_DEPLOYMENT_URL: http://agent:8123
+    depends_on:
+      agent:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const http = require('http');
+          http.get('http://localhost:3000/', (r) => process.exit(r.statusCode < 500 ? 0 : 1))
+              .on('error', () => process.exit(1))
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  # ── LangGraph JS agent ────────────────────────────────────────────────────
+  agent:
+    build:
+      context: ./apps/agent
+      dockerfile: ../../docker/Dockerfile.agent
+    ports:
+      - "${AGENT_PORT:-8123}:8123"
+    environment:
+      # LLM
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      # RFC 8693 Token Exchange — PingOne token endpoint
+      PINGONE_TOKEN_ENDPOINT: ${OIDC_TOKEN_ENDPOINT}
+      # Agent's own client credentials (client_credentials + token exchange grant)
+      AGENT_CLIENT_ID: ${AGENT_CLIENT_ID}
+      AGENT_CLIENT_SECRET: ${AGENT_CLIENT_SECRET}
+      AGENT_CC_SCOPE: ${AGENT_CC_SCOPE:-mcp:travel_tools mcp:weather_tools}
+      # MCP server routing — direct mode (overridden in docker-compose.gateway.yml)
+      MCP_SERVERS: >-
+        {"travel":"http://mcp-travel:3100/mcp","weather":"http://mcp-weather:3150/mcp"}
+    depends_on:
+      mcp-travel:
+        condition: service_healthy
+      mcp-weather:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const http = require('http');
+          http.get('http://localhost:8123/ok', (r) => process.exit(r.statusCode === 200 ? 0 : 1))
+              .on('error', () => process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Travel MCP server ─────────────────────────────────────────────────────
+  mcp-travel:
+    build:
+      context: ./apps/mcp-server
+      dockerfile: ../../docker/Dockerfile.mcp-server
+    ports:
+      - "${TRAVEL_PORT:-3100}:3100"
+    environment:
+      PORT: 3100
+      # JWT validation — must match what PingOne puts in the aud claim of exchanged tokens.
+      # Set TRAVEL_SERVER_AUDIENCE to the PingOne Resource URL you registered for this server.
+      PINGONE_ISSUER: ${OIDC_ISSUER}
+      PINGONE_JWKS_URI: ${OIDC_JWKS_URI}
+      MCP_AUDIENCE: ${TRAVEL_SERVER_AUDIENCE:-http://localhost:3100}
+      # Downstream travel data API (Docker-internal)
+      API_BASE_URL: http://travel-api:3200
+      API_KEY: ${TRAVEL_API_KEY:-dev-travel-api-key-change-in-production}
+    depends_on:
+      travel-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const http = require('http');
+          http.get('http://localhost:3100/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))
+              .on('error', () => process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Weather MCP server ────────────────────────────────────────────────────
+  mcp-weather:
+    build:
+      context: ./apps/weather-server
+      dockerfile: ../../docker/Dockerfile.weather-server
+    ports:
+      - "${WEATHER_PORT:-3150}:3150"
+    environment:
+      PORT: 3150
+      # JWT validation — set WEATHER_SERVER_AUDIENCE to the PingOne Resource URL
+      # registered for the weather server.
+      PINGONE_ISSUER: ${OIDC_ISSUER}
+      PINGONE_JWKS_URI: ${OIDC_JWKS_URI}
+      MCP_AUDIENCE: ${WEATHER_SERVER_AUDIENCE:-http://localhost:3150}
+      PUBLIC_URL: ${WEATHER_SERVER_AUDIENCE:-http://localhost:3150}
+      ALLOWED_ORIGINS: ${AUTH_URL:-http://localhost:3000}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const http = require('http');
+          http.get('http://localhost:3150/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))
+              .on('error', () => process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Travel data REST API ──────────────────────────────────────────────────
+  # Internal service — only reachable by mcp-travel. Not exposed externally.
+  travel-api:
+    build:
+      context: ./apps/api
+      dockerfile: ../../docker/Dockerfile.api
+    environment:
+      PORT: 3200
+      API_KEY: ${TRAVEL_API_KEY:-dev-travel-api-key-change-in-production}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const http = require('http');
+          http.get('http://localhost:3200/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))
+              .on('error', () => process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped

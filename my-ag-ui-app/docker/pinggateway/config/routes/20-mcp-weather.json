@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "Route: /weather/* → http://mcp-weather:3150",
+    "",
+    "Requests arriving at PingGateway with a path beginning /weather are",
+    "reverse-proxied to the Weather MCP server after stripping the /weather",
+    "prefix so the upstream always sees /mcp, /health, etc.",
+    "",
+    "See 10-mcp-travel.json for notes on optional JWT enforcement."
+  ],
+  "name": "mcp-weather",
+  "condition": "${find(request.uri.path, '^/weather')}",
+  "handler": {
+    "type": "Chain",
+    "config": {
+      "filters": [
+        {
+          "_comment": "Strip the /weather prefix before forwarding to the upstream.",
+          "name": "StripWeatherPrefix",
+          "type": "ScriptableFilter",
+          "config": {
+            "type": "application/x-groovy",
+            "source": [
+              "def newPath = request.uri.path.replaceFirst('^/weather', '')",
+              "request.uri.path = newPath ?: '/'",
+              "return next.handle(context, request)"
+            ]
+          }
+        }
+
+        /*
+         * OPTIONAL: Uncomment to validate Bearer tokens at the gateway layer.
+         * See 10-mcp-travel.json for full configuration example.
+        ,{
+          "name": "WeatherJwtValidator",
+          "type": "OAuth2ResourceServerFilter",
+          "config": {
+            "accessTokenResolver": {
+              "type": "StatelessAccessTokenResolver",
+              "config": {
+                "issuer": "${system['OIDC_ISSUER']}",
+                "verificationSecretId": "jwks",
+                "secretsProvider": {
+                  "type": "JwkSetSecretStore",
+                  "config": {
+                    "jwkUrl": "${system['OIDC_JWKS_URI']}"
+                  }
+                }
+              }
+            }
+          }
+        }
+        */
+      ],
+      "handler": {
+        "name": "WeatherMcpProxy",
+        "type": "ReverseProxyHandler",
+        "config": {
+          "baseURI": "http://mcp-weather:3150",
+          "responseTimeout": "10 minutes"
+        }
+      }
+    }
+  }
+}

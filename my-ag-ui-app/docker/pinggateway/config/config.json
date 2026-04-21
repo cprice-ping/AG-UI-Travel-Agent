@@ -1,0 +1,23 @@
+{
+  "_comment": [
+    "PingGateway server configuration.",
+    "This file is loaded from /var/openig/config/config.json.",
+    "",
+    "The heap pre-declares shared objects available to all routes.",
+    "Routes in the config/routes/ directory are loaded automatically.",
+    "",
+    "responseTimeout is set generously to accommodate SSE streaming",
+    "connections that MCP servers keep open for server-push notifications."
+  ],
+  "heap": [
+    {
+      "name": "ReverseProxyHandler",
+      "type": "ReverseProxyHandler",
+      "config": {
+        "connections": 64,
+        "responseTimeout": "10 minutes",
+        "hostnameVerifier": "ALLOW_ALL"
+      }
+    }
+  ]
+}
