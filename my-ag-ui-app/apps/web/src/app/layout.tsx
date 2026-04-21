@@ -19,7 +19,7 @@ export default function RootLayout({
     <html lang="en">
       <body className={"antialiased"}>
         {/* SessionProvider makes useSession() available throughout the app */}
-        <SessionProvider>
+        <SessionProvider refetchOnWindowFocus={true}>
           <CopilotKit runtimeUrl="/api/copilotkit" agent="starterAgent">
             {children}
           </CopilotKit>

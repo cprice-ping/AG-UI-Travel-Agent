@@ -3,7 +3,7 @@
 import { useCoAgent, useCopilotAction } from "@copilotkit/react-core";
 import { CopilotKitCSSProperties, CopilotSidebar } from "@copilotkit/react-ui";
 import { useSession, signOut } from "next-auth/react";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 
 // ─── Types (mirror agent state) ──────────────────────────────────────────────
@@ -112,26 +112,48 @@ function TravelContent() {
   const accessToken = (session as { accessToken?: string } | null)?.accessToken ?? "";
   const router = useRouter();
 
+  // Track the popup window directly so the opener can deterministically
+  // detect when the auth flow finishes, without cross-window messaging.
+  const loginPopupRef = useRef<Window | null>(null);
+  const loginPollRef = useRef<number | null>(null);
+
   /**
    * Open PingOne login in a centred popup window so the main tab — and all
    * agent state (destinations, itinerary, chat history) — is preserved.
-   * After a successful callback, Auth.js redirects the popup to /auth/close,
-   * which posts a message back here and calls window.close().
    */
   useEffect(() => {
-    async function onMessage(event: MessageEvent) {
-      if (event.origin !== window.location.origin) return;
-      if (event.data === "auth:complete") {
-        // router.refresh() busts the Next.js route cache so the subsequent
-        // update() call gets a fresh (authenticated) session from the server.
-        router.refresh();
-        await refreshSession();
+    return () => {
+      if (loginPollRef.current !== null) {
+        window.clearInterval(loginPollRef.current);
       }
-    }
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
+      loginPopupRef.current = null;
+      loginPollRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function refreshAuthState() {
+    await refreshSession();
+    router.refresh();
+  }
+
+  function startLoginPolling() {
+    if (loginPollRef.current !== null) {
+      window.clearInterval(loginPollRef.current);
+    }
+
+    loginPollRef.current = window.setInterval(async () => {
+      const popup = loginPopupRef.current;
+      if (!popup || popup.closed) {
+        if (loginPollRef.current !== null) {
+          window.clearInterval(loginPollRef.current);
+        }
+        loginPopupRef.current = null;
+        loginPollRef.current = null;
+        await refreshAuthState();
+      }
+    }, 500);
+  }
 
   function handleLogin() {
     const width = 520;
@@ -142,13 +164,19 @@ function TravelContent() {
     // /auth/signin is an intermediate page that calls signIn() as a POST on
     // mount — window.open() can only do GET, so we can't hit /api/auth/signin
     // directly (Auth.js v5 requires POST for that endpoint).
-    // NOTE: do NOT include 'noreferrer' — it sets window.opener=null in the
-    // popup, breaking the postMessage back to this tab.
-    window.open(
+    const popup = window.open(
       "/auth/signin",
       "pingone-login",
       `width=${width},height=${height},left=${left},top=${top},popup=1`,
     );
+
+    if (!popup) {
+      void refreshAuthState();
+      return;
+    }
+
+    loginPopupRef.current = popup;
+    startLoginPolling();
   }
 
   const { state, setState } = useCoAgent<AgentState>({
@@ -357,38 +385,17 @@ function TravelContent() {
       {/* Header */}
       <header className="bg-white/10 backdrop-blur-md border-b border-white/20 px-6 py-4 sticky top-0 z-10">
         <div className="max-w-5xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <span className="text-3xl">✈️</span>
-            <div>
-              <h1 className="text-xl font-bold text-white">AI Travel Planner</h1>
-              <p className="text-sky-200 text-sm">Powered by Gemini + AG-UI + MCP</p>
-            </div>
-          </div>
-
-          {/* Right side: budget pill + auth button */}
-          <div className="flex items-center gap-3">
-            {/* Budget pill */}
-            {state.budget && (
-              <div className="flex items-center gap-3 bg-white/10 rounded-full px-4 py-2">
-                <span className="text-white/70 text-sm">Budget:</span>
-                <span className="text-white font-semibold">
-                  {state.budget.currency} {state.budget.total.toLocaleString()}
-                </span>
-                <div className="w-24 h-2 bg-white/20 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-gradient-to-r from-emerald-400 to-sky-400 rounded-full transition-all"
-                    style={{ width: `${budgetPercent}%` }}
-                  />
-                </div>
-                <span className="text-white/70 text-sm">
-                  {totalActivityCost > 0
-                    ? `~${state.budget.currency} ${totalActivityCost} planned`
-                    : `${budgetPercent}% allocated`}
-                </span>
+          {/* Left side: title + auth */}
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-3">
+              <span className="text-3xl">✈️</span>
+              <div>
+                <h1 className="text-xl font-bold text-white">AI Travel Planner</h1>
+                <p className="text-sky-200 text-sm">Powered by Gemini + AG-UI + MCP</p>
               </div>
-            )}
+            </div>
 
-            {/* Auth button */}
+            {/* Auth indicator — left of header so the chatbot sidebar doesn't cover it */}
             {authStatus === "loading" ? (
               <div className="w-24 h-9 rounded-full bg-white/10 animate-pulse" />
             ) : session ? (
@@ -418,6 +425,27 @@ function TravelContent() {
               </button>
             )}
           </div>
+
+          {/* Right side: budget pill */}
+          {state.budget && (
+            <div className="flex items-center gap-3 bg-white/10 rounded-full px-4 py-2">
+              <span className="text-white/70 text-sm">Budget:</span>
+              <span className="text-white font-semibold">
+                {state.budget.currency} {state.budget.total.toLocaleString()}
+              </span>
+              <div className="w-24 h-2 bg-white/20 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-emerald-400 to-sky-400 rounded-full transition-all"
+                  style={{ width: `${budgetPercent}%` }}
+                />
+              </div>
+              <span className="text-white/70 text-sm">
+                {totalActivityCost > 0
+                  ? `~${state.budget.currency} ${totalActivityCost} planned`
+                  : `${budgetPercent}% allocated`}
+              </span>
+            </div>
+          )}
         </div>
       </header>
 

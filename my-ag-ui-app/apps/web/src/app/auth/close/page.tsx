@@ -5,14 +5,11 @@ import { useEffect } from "react";
 /**
  * Landing page for the PingOne login popup.
  * Auth.js redirects here after a successful callback.
- * This page closes the popup — the main tab stays intact.
+ * This page only closes the popup — the opener watches the popup handle and
+ * refreshes its session when the window is closed.
  */
 export default function AuthClosePage() {
   useEffect(() => {
-    // Signal the opener that login succeeded, then close.
-    if (window.opener) {
-      window.opener.postMessage("auth:complete", window.location.origin);
-    }
     window.close();
   }, []);
 
