@@ -4,27 +4,32 @@
  *
  * TOKEN ARCHITECTURE — RFC 8693 Token Exchange
  * ─────────────────────────────────────────────
- * The browser performs plain OIDC login and passes the resulting person token
- * (subject_token) to this Agent via useCoAgent state (userTokens._subject).
+ * The browser performs plain OIDC login (1st-party, implied consent) and passes
+ * the resulting person token to this Agent via useCoAgent state (userTokens._subject).
+ *
+ * Person token claims:
+ *   aud   = api.pingone.com  (standard PingOne audience — no resource binding)
+ *   scope = openid profile email  (identity only, no MCP scopes)
+ *   sub   = the authenticated user
  *
  * This Agent holds its own PingOne client credentials (AGENT_CLIENT_ID /
  * AGENT_CLIENT_SECRET) and independently fetches a client_credentials token
- * (actor_token) at startup. This token is cached for its lifetime.
+ * (actor_token). This token is cached for its lifetime.
  *
- * Before connecting to each MCP server, the Agent performs RFC 8693 Token
- * Exchange to produce a short-lived MCP-scoped token:
- *   subject_token      = person token   (WHO — identity delegation from user)
- *   actor_token        = agent CC token (WHICH component — server-side only)
- *   audience           = MCP server URL (scopes aud to that specific server)
+ * Before connecting to each MCP server the Agent performs RFC 8693 Token Exchange,
+ * requesting the MCP scope for that server. PingOne maps scope → Resource → aud:
+ *   subject_token      = person token     (WHO — identity delegation from user)
+ *   actor_token        = agent CC token   (WHICH component — server-side only)
+ *   scope              = mcp:<server>_tools  (single scope → single aud in TX token)
  *   requested_token_type = access_token
- * → MCP token: aud=<server-url>, act=<agent-client-id>, sub=<user>
+ * → TX token: aud=[<mcp-server-url>], act={sub: agent-client-id}, sub=<user>
  *
- * Security property: stealing the person token from the browser does NOT
- * grant MCP access — the agent CC token (held only server-side) is also
- * required to complete the exchange. Neither token alone is sufficient.
+ * Security property: the person token alone cannot call any MCP server — the
+ * Agent's client secret (held only server-side) is also required to complete
+ * the exchange. Neither token alone is sufficient.
  *
- * MCP tool exchange tokens are cached per (subject_token, server) pair with
- * a TTL slightly shorter than PingOne's token lifetime.
+ * TX tokens are cached per (subject_token, server) pair with a TTL slightly
+ * shorter than PingOne's token lifetime.
  */
 
 import { RunnableConfig } from "@langchain/core/runnables";
@@ -194,25 +199,24 @@ const exchangeCache = new Map<string, { token: string; expiresAt: number }>();
 const EXCHANGE_TTL_MS = 4 * 60 * 1000; // 4 minutes (conservative vs PingOne's 5m default)
 
 /**
- * Performs RFC 8693 Token Exchange to obtain a short-lived MCP server token.
+ * Performs RFC 8693 Token Exchange to obtain a short-lived TX token for one MCP server.
  *
- * PingOne requirements:
- *   - The Agent application must have Token Exchange grant enabled in PingOne
- *   - The subject_token's aud must match the Agent resource (AUTH_AGENT_RESOURCE)
- *   - The audience parameter must be a registered PingOne Resource URL
+ * PingOne behavior (scope-driven aud):
+ *   - `scope` determines which Resource(s) appear in the TX token's `aud` claim
+ *   - Sending a single scope → single aud → token only valid at that MCP server
+ *   - No `audience` param needed; PingOne derives aud from the Resource linked to the scope
  *
- * The resulting token has:
- *   aud = serverUrl  (only valid for this specific MCP server)
- *   sub = user sub   (delegated user identity)
+ * The resulting TX token has:
+ *   aud = [<mcp-server-url>]   (the Resource URL mapped to `scope` in PingOne)
+ *   sub = user sub             (delegated user identity from person token)
  *   act = { sub: AGENT_CLIENT_ID }  (proves which component performed the exchange)
  */
 async function exchangeForMcpToken(
   subjectToken: string,
   actorToken: string,
   serverUrl: string,
+  scope: string,
 ): Promise<string> {
-  // Use first 16 chars of subject token as cache key fragment (JWT header is public)
-  const audience = serverUrl.replace(/\/mcp$/, "");
   const cacheKey = `${subjectToken.slice(0, 16)}::${serverUrl}`;
   const cached = exchangeCache.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) {
@@ -221,7 +225,7 @@ async function exchangeForMcpToken(
   }
 
   console.log(`[token] exchange MISS — performing RFC 8693 Token Exchange`);
-  console.log(`[token]   audience=${audience}`);
+  console.log(`[token]   scope=${scope}  server=${serverUrl}`);
   logTokenClaims("subject_token (person, input)", subjectToken);
   logTokenClaims("actor_token (agent CC, input)", actorToken);
 
@@ -236,44 +240,56 @@ async function exchangeForMcpToken(
       subject_token_type: "urn:ietf:params:oauth:token-type:access_token",
       actor_token: actorToken,
       actor_token_type: "urn:ietf:params:oauth:token-type:access_token",
-      // audience = the MCP server's registered resource URL in PingOne
-      // PingOne will set aud = this value on the issued token
-      audience,
+      // Single scope → PingOne issues token with aud = that Resource's URL only.
+      // One exchange per MCP server keeps tokens server-scoped (option B).
+      scope,
       requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
     }),
   });
 
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`[agent] Token Exchange failed for ${serverUrl}: ${body}`);
+    throw new Error(`[agent] Token Exchange failed for ${serverUrl} (scope=${scope}): ${body}`);
   }
 
   const data = await resp.json() as { access_token: string; expires_in?: number };
   const ttl = Math.min((data.expires_in ?? 300) * 1000, EXCHANGE_TTL_MS);
   exchangeCache.set(cacheKey, { token: data.access_token, expiresAt: Date.now() + ttl });
-  console.log(`[agent] ✅ MCP token exchanged for ${serverUrl}`);
-  logTokenClaims(`mcp_token (output, aud=${audience})`, data.access_token);
+  console.log(`[agent] ✅ TX token issued for ${serverUrl}`);
+  logTokenClaims(`tx_token (output, scope=${scope})`, data.access_token);
   return data.access_token;
 }
 
 // ─── MCP server config ───────────────────────────────────────────────────────
 
+type McpServerConfig = { url: string; scope: string };
+
 /**
- * MCP server registry — a map of server name → URL.
+ * MCP server registry — a map of server name → { url, scope }.
  * Configure via MCP_SERVERS env var as JSON:
- *   MCP_SERVERS={"travel":"http://localhost:3100/mcp","weather":"http://localhost:3200/mcp"}
- * Falls back to MCP_SERVER_URL for single-server backward compatibility.
+ *   MCP_SERVERS={"travel":{"url":"http://localhost:3100/mcp","scope":"mcp:travel_tools"},
+ *               "weather":{"url":"http://localhost:3150/mcp","scope":"mcp:weather_tools"}}
+ *
+ * Each server gets its own Token Exchange call requesting only its scope.
+ * PingOne returns a TX token with aud = that server's Resource URL only.
+ * Falls back to MCP_SERVER_URL (no scope) for single-server backward compatibility.
  */
-function parseMcpServers(): Record<string, string> {
+function parseMcpServers(): Record<string, McpServerConfig> {
   const raw = process.env.MCP_SERVERS;
   if (raw) {
     try {
-      return JSON.parse(raw) as Record<string, string>;
+      const parsed = JSON.parse(raw) as Record<string, McpServerConfig | string>;
+      return Object.fromEntries(
+        Object.entries(parsed).map(([name, val]) => [
+          name,
+          typeof val === "string" ? { url: val, scope: "" } : val,
+        ]),
+      );
     } catch {
       console.error("[agent] Failed to parse MCP_SERVERS env var — falling back to MCP_SERVER_URL");
     }
   }
-  return { travel: process.env.MCP_SERVER_URL ?? "http://localhost:3100/mcp" };
+  return { travel: { url: process.env.MCP_SERVER_URL ?? "http://localhost:3100/mcp", scope: "" } };
 }
 
 const MCP_SERVERS = parseMcpServers();
@@ -302,15 +318,15 @@ async function createMcpClient(subjectToken: string): Promise<MultiServerMCPClie
   }> = {};
 
   await Promise.all(
-    Object.entries(MCP_SERVERS).map(async ([name, url]) => {
+    Object.entries(MCP_SERVERS).map(async ([name, { url, scope }]) => {
       try {
-        const mcpToken = await exchangeForMcpToken(subjectToken, actorToken, url);
+        const txToken = await exchangeForMcpToken(subjectToken, actorToken, url, scope);
         mcpServers[name] = {
           url,
-          headers: { Authorization: `Bearer ${mcpToken}` },
+          headers: { Authorization: `Bearer ${txToken}` },
           automaticSSEFallback: false,
         };
-        console.log(`[agent] ✅ ${name} → Bearer mcp_token ready`);
+        console.log(`[agent] ✅ ${name} → Bearer tx_token ready (scope=${scope})`);
       } catch (err) {
         console.error(`[agent] ❌ Skipping ${name}: ${(err as Error).message}`);
       }

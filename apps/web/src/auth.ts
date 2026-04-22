@@ -4,25 +4,24 @@
  * TOKEN ARCHITECTURE — Person Token (Subject Token)
  * ──────────────────────────────────────────────────
  * The browser performs a plain OIDC authorization code flow. The resulting
- * access token is the RFC 8693 subject_token — it proves WHO the user is.
+ * access token is a standard OIDC token — it proves WHO the user is.
+ *   aud   = api.pingone.com  (PingOne's own API audience, no resource binding)
+ *   scope = openid profile email  (identity only — no MCP scopes)
+ *   sub   = the authenticated user
  *
- * RFC 8707 resource indicator (AUTH_AGENT_RESOURCE) scopes the token to the
- * Agent's audience. This means:
- *   - aud = Agent URL  → token can only be used as a subject_token by the Agent
- *   - Possession of this token alone cannot call any MCP server
- *   - An attacker who steals it from the browser still can't access MCP tools
- *     (they'd also need the Agent's client credentials to perform the exchange)
+ * This is a 1st-party flow with implied consent. MCP tool scopes are NOT
+ * requested at login — the Agent specifies them at Token Exchange time.
+ * This keeps the login flow completely decoupled from MCP server topology.
  *
  * The Agent independently obtains its own token via client_credentials, then
- * performs RFC 8693 Token Exchange combining both:
- *   subject_token = person token  (WHO — from browser via agent state)
- *   actor_token   = agent CC token (WHICH component — held server-side only)
- *   audience      = MCP server URL (per server from MCP_SERVERS config)
- * → MCP token: aud=<mcp-server>, act=<agent>, sub=<user>
+ * performs RFC 8693 Token Exchange combining both tokens with the MCP scope:
+ *   subject_token = person token     (WHO — from browser via agent state)
+ *   actor_token   = agent CC token   (WHICH component — held server-side only)
+ *   scope         = mcp:<server>_tools  (requested at exchange time)
+ * → TX token: aud=<mcp-server>, act={sub: agent-client-id}, sub=<user>
  *
- * SCOPES: Plain identity only (openid profile email). MCP tool scopes
- * are NOT requested here — the Agent specifies them at exchange time.
- * This keeps the login flow decoupled from the MCP server topology.
+ * Security: the person token alone cannot call any MCP server — the Agent's
+ * client secret (held only server-side) is required to complete the exchange.
  */
 
 import NextAuth from "next-auth";
@@ -30,9 +29,9 @@ import NextAuth from "next-auth";
 declare module "next-auth" {
   interface Session {
     /**
-     * Person token — aud = Agent (AUTH_AGENT_RESOURCE).
-     * RFC 8693 subject_token. Passed to Agent via useCoAgent state
-     * as userTokens._subject for use in Token Exchange.
+     * Person token — plain OIDC access token (aud = api.pingone.com).
+     * Passed to Agent via useCoAgent state as userTokens._subject.
+     * Agent uses it as the RFC 8693 subject_token in Token Exchange.
      */
     accessToken?: string;
     /** PingOne preferred_username claim from the ID token. */
@@ -52,29 +51,20 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       clientSecret: process.env.AUTH_PINGONE_CLIENT_SECRET,
       authorization: {
         params: {
-          // Plain identity scopes — no MCP-specific scopes.
-          // MCP tool scopes are requested by the Agent at Token Exchange time,
-          // scoped to the specific MCP server being accessed.
+          // Plain identity scopes only — no MCP-specific scopes.
+          // MCP tool scopes are requested by the Agent at Token Exchange time.
           scope: "openid profile email",
           response_type: "code",
-          // RFC 8707: bind person token aud to the Agent.
-          // Set AUTH_AGENT_RESOURCE in .env to the Agent's registered resource URL.
-          resource: process.env.AUTH_AGENT_RESOURCE ?? "http://localhost:8123",
         },
       },
-      token: {
-        params: {
-          // Also set on the token endpoint so the code-exchange sets aud correctly.
-          resource: process.env.AUTH_AGENT_RESOURCE ?? "http://localhost:8123",
-        },
-      },
+
     },
   ],
 
   callbacks: {
     /**
      * Persist the person token in the Auth.js JWT cookie.
-     * aud = AUTH_AGENT_RESOURCE (the Agent), set by RFC 8707 above.
+     * aud = api.pingone.com (standard PingOne OIDC token).
      */
     async jwt({ token, account, profile }) {
       if (account?.access_token) {

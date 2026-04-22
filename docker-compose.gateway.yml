@@ -54,7 +54,7 @@ services:
       # Gateway listens on :8080 inside the Docker network.
       # Adjust the path prefixes to match your PingGateway route config.
       MCP_SERVERS: >-
-        {"travel":"http://pinggateway:8080/travel/mcp","weather":"http://pinggateway:8080/weather/mcp"}
+        {"travel":{"url":"http://pinggateway:8080/travel/mcp","scope":"mcp:travel_tools"},"weather":{"url":"http://pinggateway:8080/weather/mcp","scope":"mcp:weather_tools"}}
     depends_on:
       pinggateway:
         condition: service_healthy

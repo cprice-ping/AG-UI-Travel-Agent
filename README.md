@@ -43,10 +43,10 @@ Browser
 ### Token architecture — RFC 8693 Token Exchange
 
 ```
-1. User logs in via PingOne popup
+1. User logs in via PingOne popup (1st-party, implied consent)
    → Auth.js issues person token
-     aud = Agent Resource URL  (RFC 8707 resource indicator)
-     scope = openid profile email
+     aud   = api.pingone.com  (standard PingOne OIDC audience)
+     scope = openid profile email  (identity only, no MCP scopes)
 
 2. Person token passed to Agent via CopilotKit/AG-UI state
    (subject_token — proves WHO the user is)
@@ -55,14 +55,14 @@ Browser
    → Fetches CC token from PingOne (actor_token)
 
 4. Before each MCP call, Agent performs Token Exchange:
-   subject_token  = person token   (WHO — from browser)
-   actor_token    = agent CC token (WHICH component — never leaves agent)
-   audience       = MCP server URL (WHICH server)
-   → MCP token:  aud=<server>, act=<agent-client-id>, sub=<user>
+   subject_token  = person token       (WHO — from browser)
+   actor_token    = agent CC token     (WHICH component — never leaves agent)
+   audience       = MCP server URL     (WHICH server)
+   → TX token:  aud=<server>, act={sub: agent-client-id}, sub=<user>
 
-Security: stealing the person token from the browser is not enough to
-call MCP tools — the agent's client secret (held server-side) is also
-required to complete the exchange.
+PingOne maps the requested audience → Resource → sets aud on the TX token.
+Security: stealing the person token is not enough to call MCP tools —
+the agent's client secret (held server-side) is also required.
 ```
 
 ---
@@ -159,15 +159,6 @@ Each Resource represents an MCP server's audience:
 - Assign both scopes to the Agent application
 - Set `TRAVEL_SERVER_AUDIENCE` / `WEATHER_SERVER_AUDIENCE` in `.env` to match the audience URLs exactly
 
-### 4. Agent Resource (RFC 8707)
-
-Register a Resource for the Agent itself:
-
-| Resource | Audience URL |
-|---|---|
-| Agent | `http://localhost:8123` |
-
-The web application's token will have `aud=http://localhost:8123` — this scopes the person token to the Agent so it can only be used for Token Exchange, not to call MCP servers directly.
 
 ---
 
@@ -191,7 +182,7 @@ Both MCP servers implement the MCP Streamable HTTP spec (2025-11-25):
 |---|---|
 | Frontend | Next.js 16, Tailwind CSS, CopilotKit |
 | Auth | Auth.js v5 (beta), PingOne OIDC |
-| Token security | RFC 8693 Token Exchange, RFC 8707 Resource Indicators |
+| Token security | RFC 8693 Token Exchange (1st-party, implied consent) |
 | Agent | LangGraph JS, `@langchain/google-genai` (Gemini 2.5 Flash) |
 | MCP transport | `@modelcontextprotocol/sdk` Streamable HTTP |
 | JWT validation | `jose` (JWKS, issuer, audience) |

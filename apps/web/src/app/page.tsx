@@ -105,10 +105,10 @@ export default function TravelAgentPage() {
 
 function TravelContent() {
   const { data: session, status: authStatus, update: refreshSession } = useSession();
-  // Person token — aud = Agent (RFC 8707). RFC 8693 subject_token.
-  // The Agent combines this with its own client_credentials token to perform
-  // Token Exchange, yielding per-MCP-server tokens. The browser never sees
-  // or produces MCP-scoped tokens directly.
+  // Person token — plain OIDC token (aud = api.pingone.com, scope = openid profile email).
+  // Passed to Agent as RFC 8693 subject_token. The Agent combines it with its own
+  // client_credentials token to perform Token Exchange per MCP server, yielding
+  // single-scoped TX tokens. The browser never holds MCP-scoped tokens.
   const accessToken = (session as { accessToken?: string } | null)?.accessToken ?? "";
   const router = useRouter();
 

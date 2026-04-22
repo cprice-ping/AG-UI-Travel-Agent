@@ -31,9 +31,6 @@ services:
       AUTH_PINGONE_ISSUER: ${OIDC_ISSUER}
       AUTH_URL: ${AUTH_URL:-http://localhost:3000}
       NEXTAUTH_URL: ${AUTH_URL:-http://localhost:3000}
-      # RFC 8707: person token aud = Agent URL.
-      # Must match what you registered as the Agent Resource in PingOne.
-      AUTH_AGENT_RESOURCE: ${AGENT_RESOURCE_URL:-http://localhost:8123}
       # Agent endpoint (Docker-internal)
       LANGGRAPH_DEPLOYMENT_URL: http://agent:8123
     depends_on:
@@ -72,7 +69,7 @@ services:
       AGENT_CC_SCOPE: ${AGENT_CC_SCOPE:-mcp:travel_tools mcp:weather_tools}
       # MCP server routing — direct mode (overridden in docker-compose.gateway.yml)
       MCP_SERVERS: >-
-        {"travel":"http://mcp-travel:3100/mcp","weather":"http://mcp-weather:3150/mcp"}
+        {"travel":{"url":"http://mcp-travel:3100/mcp","scope":"mcp:travel_tools"},"weather":{"url":"http://mcp-weather:3150/mcp","scope":"mcp:weather_tools"}}
     depends_on:
       mcp-travel:
         condition: service_healthy
