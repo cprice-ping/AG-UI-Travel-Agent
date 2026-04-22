@@ -1,0 +1,60 @@
+# PingGateway overlay for docker-compose
+#
+# Adds PingGateway between the Agent and the MCP servers.
+# Configure PingGateway itself (routes, policies) externally — mount your
+# config directory into the container via the volume below.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gateway.yml up --build
+#
+# PingGateway image:
+#   Community / evaluation: pingidentity/openig:latest
+#   Production / licensed:  registry.pingidentity.com/pinggateway/pinggateway:<version>
+#   Override by setting PINGGATEWAY_IMAGE in .env.
+#
+# Expected gateway routing (configure in your PingGateway routes):
+#   /travel/* → http://mcp-travel:3100  (strip /travel prefix)
+#   /weather/* → http://mcp-weather:3150 (strip /weather prefix)
+
+services:
+
+  # ── PingGateway ────────────────────────────────────────────────────────────
+  pinggateway:
+    image: ${PINGGATEWAY_IMAGE:-pingidentity/openig:latest}
+    ports:
+      - "${GATEWAY_PORT:-9000}:8080"
+    volumes:
+      # Mount your PingGateway config directory here.
+      # Example:  - /path/to/your/openig-config:/var/openig/config:ro
+      - ${PINGGATEWAY_CONFIG_DIR:-./docker/pinggateway/config}:/var/openig/config:ro
+    environment:
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_JWKS_URI: ${OIDC_JWKS_URI}
+    depends_on:
+      mcp-travel:
+        condition: service_healthy
+      mcp-weather:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://localhost:8080/
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Agent — rerouted through PingGateway ───────────────────────────────────
+  agent:
+    environment:
+      # Gateway listens on :8080 inside the Docker network.
+      # Adjust the path prefixes to match your PingGateway route config.
+      MCP_SERVERS: >-
+        {"travel":{"url":"http://pinggateway:8080/travel/mcp","scope":"mcp:travel_tools"},"weather":{"url":"http://pinggateway:8080/weather/mcp","scope":"mcp:weather_tools"}}
+    depends_on:
+      pinggateway:
+        condition: service_healthy
